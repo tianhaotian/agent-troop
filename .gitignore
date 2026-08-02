@@ -1,0 +1,20 @@
+# Go
+/troopd
+*.test
+*.out
+
+# Env / local
+.env
+data/
+
+# Node (console)
+node_modules/
+dist/
+
+# Python SDK
+__pycache__/
+*.egg-info/
+.venv/
+
+# OS
+.DS_Store

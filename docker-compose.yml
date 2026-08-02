@@ -1,0 +1,38 @@
+version: "3.9"
+
+# M1 最小依赖：PG-first（设计 §22.4）。Redis/MinIO 先声明备用，M1 代码不强依赖。
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: troop
+      POSTGRES_PASSWORD: troop
+      POSTGRES_DB: troop
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U troop"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    profiles: ["full"]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: troop
+      MINIO_ROOT_PASSWORD: troop1234
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - miniodata:/data
+    profiles: ["full"]
+
+volumes:
+  pgdata:
+  miniodata:
