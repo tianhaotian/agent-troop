@@ -37,10 +37,22 @@ docs/plan/           里程碑实现计划
 ## 快速开始
 
 ```bash
-# 依赖：Go 1.21+，Docker（PostgreSQL 16 / Redis / MinIO 经 docker-compose 提供）
-docker compose up -d postgres
-go run ./cmd/troopd            # 控制平面，默认 :8080
+# 依赖：Go 1.21+（生产部署另需 Docker 提供 PostgreSQL 16）
 go test ./...                  # 交付门槛：全绿
+go test -tags e2e ./e2e/       # 端到端验收
+
+# 本地零依赖体验（内存存储）：
+go run ./cmd/troopd &                                    # 控制平面 :8080，Console 在 http://localhost:8080/
+go run ./adapters/http-echo -id echo1 -skills web.research &
+curl -X POST localhost:8080/v1/missions -d '{
+  "owner": "me", "goal": "demo",
+  "tasks": [{"name":"collect","kind":"agent","required_skills":["web.research"]}]
+}'
+
+# 持久化（PG-first）：
+docker compose up -d postgres
+psql postgres://troop:troop@localhost:5432/troop -f migrations/0001_init.sql
+TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
 ```
 
 ## 路线图（详见设计文档 §12.2）

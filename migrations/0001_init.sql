@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE TABLE IF NOT EXISTS events (
     seq             BIGSERIAL PRIMARY KEY,
     aggregate_id    TEXT NOT NULL,               -- mission / subtask / agent id
+    mission_id      TEXT,                        -- 冗余便于 Mission 级 SSE 查询
     type            TEXT NOT NULL,               -- mission.created / subtask.leased / ...
     payload         JSONB NOT NULL DEFAULT '{}',
     actor           JSONB NOT NULL DEFAULT '{}', -- {kind, id}
@@ -84,7 +85,18 @@ CREATE TABLE IF NOT EXISTS events (
     trace_id        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_mission   ON events(mission_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_type      ON events(type);
+
+-- fencing token 全局单调序列（§4.3）
+CREATE SEQUENCE IF NOT EXISTS fencing_seq START 1;
+
+-- 幂等键（Agent 结果上报去重，§4.3）
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key         TEXT PRIMARY KEY,
+    result      TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS decisions (
     id              TEXT PRIMARY KEY,

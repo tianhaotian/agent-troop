@@ -1,10 +1,10 @@
-// troopd：Agent Troop 控制平面单二进制（M1：API 骨架，后续切片逐步挂载
-// Orchestrator / Scheduler / Registry，见 docs/plan/M1-mvp.md）。
+// troopd：Agent Troop 控制平面单二进制。
+// 存储：TROOP_PG_DSN 设置时用 PostgreSQL（docker compose up -d postgres），
+// 否则回退内存存储（本地零依赖体验；数据不持久）。
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -12,55 +12,78 @@ import (
 	"syscall"
 	"time"
 
+	"agenttroop/internal/api"
 	"agenttroop/internal/clock"
+	"agenttroop/internal/core"
+	"agenttroop/internal/store"
+	"agenttroop/internal/store/memory"
+	"agenttroop/internal/store/pg"
 )
 
 func main() {
-	clk := clock.RealClock{} // ADR-8：时钟注入，禁止散落 time.Now()
+	clk := clock.RealClock{} // ADR-8：时钟注入
+	ctx := context.Background()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "ok",
-			"ts":     clk.Now().UTC().Format(time.RFC3339Nano),
-		})
+	var st store.Store
+	if dsn := os.Getenv("TROOP_PG_DSN"); dsn != "" {
+		pgStore, err := pg.Connect(ctx, dsn)
+		if err != nil {
+			log.Fatalf("connect pg: %v", err)
+		}
+		defer pgStore.Close()
+		st = pgStore
+		log.Printf("store: postgresql")
+	} else {
+		st = memory.New()
+		log.Printf("store: in-memory (set TROOP_PG_DSN for persistence)")
+	}
+
+	svc := core.New(st, clk, core.DefaultConfig())
+	handler := api.New(svc).Handler()
+
+	// 后台循环：调度器 + 清扫器（轮询间隔为运行机制，非业务时间语义）
+	stop := make(chan struct{})
+	go loop(stop, 500*time.Millisecond, func() {
+		if _, err := svc.ScheduleOnce(ctx); err != nil {
+			log.Printf("schedule: %v", err)
+		}
+	})
+	go loop(stop, 5*time.Second, func() {
+		if err := svc.SweepOnce(ctx); err != nil {
+			log.Printf("sweep: %v", err)
+		}
 	})
 
-	// S8 占位：任务面 API 在后续切片实现（docs/plan/M1-mvp.md）
-	mux.HandleFunc("POST /v1/missions", notImplemented)
-	mux.HandleFunc("GET /v1/missions/{id}", notImplemented)
-
 	addr := envOr("TROOPD_ADDR", ":8080")
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		log.Printf("troopd listening on %s", addr)
+		log.Printf("troopd listening on %s (console: http://localhost%s/)", addr, addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve: %v", err)
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	close(stop)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("shutdown: %v", err)
+	_ = srv.Shutdown(shutdownCtx)
+}
+
+func loop(stop <-chan struct{}, interval time.Duration, fn func()) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			fn()
+		}
 	}
-}
-
-func notImplemented(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{
-		"error": "not implemented in M1 slice S1; see docs/plan/M1-mvp.md",
-	})
-}
-
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
 }
 
 func envOr(key, def string) string {

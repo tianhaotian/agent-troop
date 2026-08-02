@@ -1,5 +1,9 @@
 # M1 MVP 实现计划
 
+> **状态：✅ 已交付**（2026-08-02）。全部切片完成，`go test ./...` 与 `go test -tags e2e ./e2e/` 全绿，
+> 冒烟验证通过（troopd + 两个 http-echo Adapter，链式 Mission SUCCEEDED，接力正确）。
+> 唯一环境限制：本机 Docker 未运行，PG 一致性测试（`TROOP_TEST_PG`）待有 Docker 环境后启用补跑。
+
 > 对应设计文档 §12.2 M1。目标：**两个 Agent（一个经通用 HTTP Adapter 接入的回显 Agent + 一个模拟 Agent）接力完成一次 Mission，全程状态可查、事件可回放。**
 > 流程约定：本计划先行；每个切片实现后 `go test ./...` 全绿才标记完成。
 
