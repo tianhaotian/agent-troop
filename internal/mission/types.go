@@ -2,7 +2,10 @@
 // 对应设计文档 §3.2（任务模型）与 §7.3（WAITING 挂起-唤醒路径）。
 package mission
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // State 子任务状态。终态：SUCCEEDED / FAILED / CANCELLED。
 type State string
@@ -85,7 +88,18 @@ type Subtask struct {
 	Question   string          `json:"question,omitempty"`
 	Options    []string        `json:"options,omitempty"`
 	OnTimeout  string          `json:"on_timeout,omitempty"` // auto_approve | auto_reject | ""
+	// Continuation（M3，§7.3）：挂起-唤醒与检查点续跑
+	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"`   // 透明载荷（≤64KB），续跑 Agent 自行解释
+	WakeKind     string          `json:"wake_kind,omitempty"`    // timer | manual
+	WakeAt       *time.Time      `json:"wake_at,omitempty"`      // timer 唤醒时刻
+	WakeDeadline *time.Time      `json:"wake_deadline,omitempty"` // 唤醒注册 TTL（必填，过期 FAILED）
 }
+
+// Wake 类型常量（§7.3；event/condition 在 M4 引入）。
+const (
+	WakeTimer  = "timer"
+	WakeManual = "manual"
+)
 
 // Mission 顶层目标。
 type Mission struct {

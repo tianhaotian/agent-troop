@@ -239,7 +239,8 @@ func (s *Store) HeartbeatAgent(_ context.Context, id string, now time.Time) erro
 		return store.ErrNotFound
 	}
 	a.LastHeartbeat = now
-	if a.Health == "" {
+	// 心跳即存活证明：suspect 自动恢复（down 为人工/熔断标记，不自动恢复）
+	if a.Health == "" || a.Health == "suspect" {
 		a.Health = "healthy"
 	}
 	return nil
@@ -542,6 +543,119 @@ func (s *Store) BlockSubtask(_ context.Context, id string, fencingToken int64, e
 		map[string]any{"state": string(mission.StateBlocked)}, actor, now)
 	c := *sub
 	return &c, nil
+}
+
+// ---- 挂起-唤醒（M3） ----
+
+func (s *Store) SuspendSubtask(_ context.Context, id string, fencingToken int64, expectedVersion int64,
+	wakeKind string, wakeAt, wakeDeadline *time.Time, checkpoint []byte,
+	actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subtasks[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if sub.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	l, err := s.checkFencingLocked(sub, fencingToken)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := mission.Apply(sub.State, mission.EvSuspended); err != nil {
+		return nil, store.ErrConflict
+	}
+	sub.State = mission.StateWaiting
+	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = wakeKind, wakeAt, wakeDeadline
+	if len(checkpoint) > 0 {
+		sub.Checkpoint = append([]byte(nil), checkpoint...)
+	}
+	sub.Version++
+	s.releaseLeaseLocked(l)
+	sub.Assignee, sub.LeaseID = "", ""
+	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvSuspended), map[string]any{
+		"state":    string(mission.StateWaiting),
+		"wake_kind": wakeKind,
+	}, actor, now)
+	c := *sub
+	return &c, nil
+}
+
+func (s *Store) WakeSubtask(_ context.Context, id string, expectedVersion int64,
+	actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subtasks[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if sub.Version != expectedVersion {
+		return nil, store.ErrConflict // CAS 竞争：另一 sweeper/wake 已处理
+	}
+	if _, err := mission.Apply(sub.State, mission.EvWoken); err != nil {
+		return nil, store.ErrConflict
+	}
+	sub.State = mission.StateReady
+	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = "", nil, nil // 一次性注册，清空
+	sub.Version++
+	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvWoken),
+		map[string]any{"state": string(mission.StateReady)}, actor, now)
+	c := *sub
+	return &c, nil
+}
+
+func (s *Store) ListWaitingDue(_ context.Context, now time.Time) ([]*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*mission.Subtask
+	for _, sub := range s.subtasks {
+		if sub.State == mission.StateWaiting && sub.WakeKind == mission.WakeTimer &&
+			sub.WakeAt != nil && !sub.WakeAt.After(now) &&
+			(sub.WakeDeadline == nil || sub.WakeDeadline.After(now)) {
+			c := *sub
+			out = append(out, &c)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) ExpireWakes(_ context.Context, now time.Time) ([]*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*mission.Subtask
+	for _, sub := range s.subtasks {
+		if sub.State != mission.StateWaiting || sub.WakeDeadline == nil || sub.WakeDeadline.After(now) {
+			continue
+		}
+		sub.State = mission.StateFailed
+		sub.WakeKind, sub.WakeAt, sub.WakeDeadline = "", nil, nil
+		sub.Version++
+		s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvFailed), map[string]any{
+			"state":  string(mission.StateFailed),
+			"reason": "wake_timeout",
+		}, store.Actor{Kind: "system", ID: "sweeper"}, now)
+		c := *sub
+		out = append(out, &c)
+	}
+	return out, nil
+}
+
+func (s *Store) SaveCheckpoint(_ context.Context, id string, fencingToken int64, checkpoint []byte, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subtasks[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if _, err := s.checkFencingLocked(sub, fencingToken); err != nil {
+		return err
+	}
+	if sub.State != mission.StateRunning && sub.State != mission.StateBlocked {
+		return store.ErrConflict
+	}
+	sub.Checkpoint = append([]byte(nil), checkpoint...)
+	return nil
 }
 
 // ---- 决策 ----

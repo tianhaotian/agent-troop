@@ -28,14 +28,21 @@ func DefaultConfig() Config {
 }
 
 type Service struct {
-	st   store.Store
-	clk  clock.Clock
-	cfg  Config
-	blob BlobStore
+	st       store.Store
+	clk      clock.Clock
+	cfg      Config
+	blob     BlobStore
+	strategy PlacementStrategy
 }
 
 func New(st store.Store, clk clock.Clock, cfg Config) *Service {
-	return &Service{st: st, clk: clk, cfg: cfg, blob: NewMemBlob()}
+	return &Service{st: st, clk: clk, cfg: cfg, blob: NewMemBlob(), strategy: CapabilityFirst{}}
+}
+
+// WithStrategy 替换放置策略（M3-T1；cmd/troopd 由 TROOP_SCHEDULER 解析）。
+func (s *Service) WithStrategy(ps PlacementStrategy) *Service {
+	s.strategy = ps
+	return s
 }
 
 var (
@@ -298,83 +305,6 @@ func (s *Service) deriveMissionStatus(ctx context.Context, missionID string) err
 
 // ---- 放置调度（Capability-First，§5.3；Filter → Score → Offer） ----
 
-// ScheduleOnce 单轮调度：取就绪任务 → 过滤候选 → 打分 → 发放租约。
-// 返回成功放置数。多副本安全：竞争同一任务时 OfferLease 的 CAS 保证只有一个赢家。
-func (s *Service) ScheduleOnce(ctx context.Context) (int, error) {
-	ready, err := s.st.DequeueReady(ctx, s.cfg.ScheduleBatch)
-	if err != nil {
-		return 0, err
-	}
-	agents, err := s.st.ListAgents(ctx)
-	if err != nil {
-		return 0, err
-	}
-	now := s.clk.Now()
-	placed := 0
-	for _, sub := range ready {
-		if isHumanKind(sub.Kind) {
-			continue // human 节点由 OpenHumanDecisions 处理，不参与 Agent 放置
-		}
-		best := s.pickAgent(agents, sub)
-		if best == nil {
-			continue // 无合格 Agent：留在 READY 等下轮（M1 不升级）
-		}
-		if _, err := s.st.OfferLease(ctx, sub.ID, best.ID, sub.Version, s.cfg.OfferTTL,
-			store.Actor{Kind: "system", ID: "scheduler"}, now); err != nil {
-			continue // CAS 竞争失败/状态已变，下轮再来
-		}
-		best.Running++ // 本轮内的本地视图修正
-		placed++
-	}
-	return placed, nil
-}
-
-// pickAgent Filter（健康 ∧ 能力 ∧ 并发余量）+ Score（技能契合 − 负载惩罚）。
-func (s *Service) pickAgent(agents []*store.Agent, sub *mission.Subtask) *store.Agent {
-	var best *store.Agent
-	bestScore := -1.0
-	for _, a := range agents {
-		if a.Health != "" && a.Health != "healthy" {
-			continue
-		}
-		if a.MaxConcurrency > 0 && a.Running >= a.MaxConcurrency {
-			continue
-		}
-		level, ok := matchSkills(a, sub.RequiredSkills)
-		if !ok {
-			continue
-		}
-		score := level - 0.1*float64(a.Running)
-		if score > bestScore {
-			bestScore = score
-			best = a
-		}
-	}
-	return best
-}
-
-// matchSkills 返回匹配技能的最低 level（木桶原则）；缺技能返回 false。
-func matchSkills(a *store.Agent, required []string) (float64, bool) {
-	if len(required) == 0 {
-		return 0.5, true // 无技能要求：任何健康 Agent 皆可，基础分
-	}
-	levels := map[string]float64{}
-	for _, c := range a.Capabilities {
-		levels[c.Skill] = c.Level
-	}
-	min := 1.0
-	for _, sk := range required {
-		lv, ok := levels[sk]
-		if !ok {
-			return 0, false
-		}
-		if lv < min {
-			min = lv
-		}
-	}
-	return min, true
-}
-
 // ---- Agent 注册 ----
 
 func (s *Service) RegisterAgent(ctx context.Context, a *store.Agent) error {
@@ -527,5 +457,6 @@ func (s *Service) SweepOnce(ctx context.Context) error {
 		}
 		// status==expired（无 on_timeout 动作）：保持 BLOCKED 等人工干预（M2 边界）
 	}
-	return nil
+	// M3：挂起任务的 timer 唤醒与 wake TTL 回收
+	return s.sweepWakes(ctx)
 }

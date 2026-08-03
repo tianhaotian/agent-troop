@@ -38,8 +38,14 @@ func main() {
 		log.Printf("store: in-memory (set TROOP_PG_DSN for persistence)")
 	}
 
+	strategy, err := core.NewStrategy(envOr("TROOP_SCHEDULER", "capability-first"))
+	if err != nil {
+		log.Fatalf("scheduler: %v", err)
+	}
 	svc := core.New(st, clk, core.DefaultConfig()).
-		WithBlob(core.FSBlob{Dir: envOr("TROOP_BLOB_DIR", "./data/artifacts")})
+		WithBlob(core.FSBlob{Dir: envOr("TROOP_BLOB_DIR", "./data/artifacts")}).
+		WithStrategy(strategy)
+	log.Printf("scheduler: %s", strategy.Name())
 	handler := api.New(svc).Handler()
 
 	// 后台循环：调度器 + human 节点工单 + 清扫器（轮询间隔为运行机制，非业务时间语义）

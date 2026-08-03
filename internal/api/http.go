@@ -43,6 +43,8 @@ func (s *Server) Handler() http.Handler {
 	mux.handle("POST /v1/subtasks/{id}/progress", s.progress)
 	mux.handle("POST /v1/subtasks/{id}/complete", s.completeSubtask)
 	mux.handle("POST /v1/subtasks/{id}/fail", s.failSubtask)
+	mux.handle("POST /v1/subtasks/{id}/suspend", s.suspend) // M3-T4
+	mux.handle("POST /v1/subtasks/{id}/wake", s.wake)       // M3-T4
 
 	// 人工面（M2）
 	mux.handle("GET /v1/decisions", s.listDecisions)
@@ -296,8 +298,9 @@ func (s *Server) startSubtask(w http.ResponseWriter, r *http.Request) {
 }
 
 type progressReq struct {
-	LeaseID      string `json:"lease_id"`
-	FencingToken int64  `json:"fencing_token"`
+	LeaseID      string          `json:"lease_id"`
+	FencingToken int64           `json:"fencing_token"`
+	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"` // M3-T3：检查点续跑
 }
 
 func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
@@ -305,11 +308,53 @@ func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := s.svc.RenewLease(r.Context(), req.LeaseID, req.FencingToken); err != nil {
+	if err := s.svc.Progress(r.Context(), pv(r, "id"), req.LeaseID, req.FencingToken, req.Checkpoint); err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "renewed"})
+}
+
+// suspendReq M3-T4：Agent 挂起自身（Continuation，§7.3）。
+type suspendReq struct {
+	AgentID      string             `json:"agent_id"`
+	FencingToken int64              `json:"fencing_token"`
+	Version      int64              `json:"version"`
+	WakeOn       core.WakeSpec      `json:"wake_on"`
+	Checkpoint   json.RawMessage    `json:"checkpoint,omitempty"`
+}
+
+func (s *Server) suspend(w http.ResponseWriter, r *http.Request) {
+	var req suspendReq
+	if !decode(w, r, &req) {
+		return
+	}
+	sub, err := s.svc.Suspend(r.Context(), pv(r, "id"), req.FencingToken, req.Version,
+		req.AgentID, req.WakeOn, req.Checkpoint)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sub)
+}
+
+// wakeReq M3-T4：人工唤醒 WAITING 子任务。
+type wakeReq struct {
+	ActorID string `json:"actor_id"`
+}
+
+func (s *Server) wake(w http.ResponseWriter, r *http.Request) {
+	var req wakeReq
+	_ = json.NewDecoder(r.Body).Decode(&req) // 空体允许（默认匿名）
+	if req.ActorID == "" {
+		req.ActorID = "anonymous"
+	}
+	sub, err := s.svc.Wake(r.Context(), pv(r, "id"), req.ActorID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sub)
 }
 
 type completeReq struct {

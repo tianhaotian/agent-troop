@@ -177,6 +177,25 @@ type Store interface {
 	BlockSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
 		actor Actor, now time.Time) (*mission.Subtask, error)
 
+	// ---- 挂起-唤醒（M3，§7.3/§14.4） ----
+	// SuspendSubtask 校验 fencing token，RUNNING→WAITING 并**释放租约**
+	// （与 BLOCKED 不同：唤醒后重新调度，可换 Agent 凭 checkpoint 续跑）。
+	// wakeKind/wakeAt/wakeDeadline 落库；checkpoint 非空时一并保存。
+	SuspendSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
+		wakeKind string, wakeAt, wakeDeadline *time.Time, checkpoint []byte,
+		actor Actor, now time.Time) (*mission.Subtask, error)
+	// WakeSubtask CAS 唤醒 WAITING→READY 并清空 wake 字段（一次性注册语义；
+	// checkpoint 保留供续跑）。版本不匹配返回 ErrConflict（多 sweeper 竞争安全）。
+	WakeSubtask(ctx context.Context, id string, expectedVersion int64,
+		actor Actor, now time.Time) (*mission.Subtask, error)
+	// ListWaitingDue 返回 timer 到期的 WAITING 子任务（wake_at<=now 且未过 TTL）。
+	ListWaitingDue(ctx context.Context, now time.Time) ([]*mission.Subtask, error)
+	// ExpireWakes 将 wake_deadline<=now 的 WAITING 子任务置 FAILED(reason=wake_timeout)，
+	// 返回受影响子任务（级联取消与 Mission 终态推导由调用方负责）。
+	ExpireWakes(ctx context.Context, now time.Time) ([]*mission.Subtask, error)
+	// SaveCheckpoint progress 心跳携带检查点落库（fencing 校验；不迁移状态、不记事件）。
+	SaveCheckpoint(ctx context.Context, id string, fencingToken int64, checkpoint []byte, now time.Time) error
+
 	// ---- 事件 ----
 	// ListMissionEvents 返回 Mission 及子任务相关事件（SSE 驱动，按 seq 递增）。
 	ListMissionEvents(ctx context.Context, missionID string, afterSeq int64, limit int) ([]*Event, error)

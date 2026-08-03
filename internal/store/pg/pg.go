@@ -45,12 +45,16 @@ func scanSubtask(row pgx.Row) (*mission.Subtask, error) {
 	var sub mission.Subtask
 	var kind, state string
 	var spec, scheduling, retry []byte
-	var parentID, assignee, leaseID, resultRef *string
+	var parentID, assignee, leaseID, resultRef, wakeKind *string
 	var dependsOn []string
 	err := row.Scan(&sub.ID, &sub.MissionID, &parentID, &kind, &spec, &scheduling, &retry,
-		&state, &dependsOn, &assignee, &leaseID, &sub.Attempt, &resultRef, &sub.Version)
+		&state, &dependsOn, &assignee, &leaseID, &sub.Attempt, &resultRef, &sub.Version,
+		&sub.Checkpoint, &wakeKind, &sub.WakeAt, &sub.WakeDeadline)
 	if err != nil {
 		return nil, err
+	}
+	if wakeKind != nil {
+		sub.WakeKind = *wakeKind
 	}
 	sub.Kind = mission.Kind(kind)
 	sub.State = mission.State(state)
@@ -95,7 +99,8 @@ func marshalSpec(sub *mission.Subtask) []byte {
 }
 
 const subtaskCols = `id, mission_id, parent_id, kind, spec, scheduling, retry, state,
-	depends_on, assignee_agent_id, lease_id, attempt, result_ref, version`
+	depends_on, assignee_agent_id, lease_id, attempt, result_ref, version,
+	checkpoint, wake_kind, wake_at, wake_deadline`
 
 func appendEvent(ctx context.Context, tx pgx.Tx, e *store.Event) error {
 	payload, err := js(e.Payload)
@@ -280,10 +285,12 @@ func updateSubtask(ctx context.Context, tx pgx.Tx, sub *mission.Subtask, expecte
 	tag, err := tx.Exec(ctx,
 		`UPDATE subtasks SET state=$1, assignee_agent_id=NULLIF($2,''), lease_id=NULLIF($3,''),
 		 attempt=$4, result_ref=NULLIF($5,''), spec=$6, scheduling=$7, retry=$8,
+		 checkpoint=$10, wake_kind=NULLIF($11,''), wake_at=$12, wake_deadline=$13,
 		 version=version+1, updated_at=$9
-		 WHERE id=$10 AND version=$11`,
+		 WHERE id=$14 AND version=$15`,
 		string(sub.State), sub.Assignee, sub.LeaseID, sub.Attempt, sub.ResultRef,
-		spec, scheduling, retry, now, sub.ID, expectedVersion)
+		spec, scheduling, retry, now, sub.Checkpoint, sub.WakeKind, sub.WakeAt, sub.WakeDeadline,
+		sub.ID, expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -390,8 +397,12 @@ func (s *Store) ListAgents(ctx context.Context) ([]*store.Agent, error) {
 }
 
 func (s *Store) HeartbeatAgent(ctx context.Context, id string, now time.Time) error {
+	// 心跳即存活证明：suspect 自动恢复 healthy（down 不自动恢复，与 memory 实现一致）
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE agents SET health=jsonb_set(health,'{last_heartbeat}',to_jsonb($2::text)),
+		`UPDATE agents SET health=jsonb_set(
+		   jsonb_set(health,'{last_heartbeat}',to_jsonb($2::text)),
+		   '{status}', to_jsonb(CASE WHEN health->>'status'='suspect' THEN 'healthy'
+		                             ELSE health->>'status' END)),
 		 updated_at=$2 WHERE id=$1`, id, now.Format(time.RFC3339Nano))
 	if err != nil {
 		return err
@@ -721,6 +732,182 @@ func (s *Store) BlockSubtask(ctx context.Context, id string, fencingToken int64,
 	actor store.Actor, now time.Time) (*mission.Subtask, error) {
 	return s.fencedTransition(ctx, id, fencingToken, expectedVersion, mission.EvBlocked,
 		map[string]any{}, actor, now, nil)
+}
+
+// ---- 挂起-唤醒（M3） ----
+
+func (s *Store) SuspendSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
+	wakeKind string, wakeAt, wakeDeadline *time.Time, checkpoint []byte,
+	actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	sub, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sub.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	if err := loadActiveLease(ctx, tx, sub, fencingToken); err != nil {
+		return nil, err
+	}
+	if _, err := mission.Apply(sub.State, mission.EvSuspended); err != nil {
+		return nil, store.ErrConflict
+	}
+	leaseID := sub.LeaseID
+	sub.State = mission.StateWaiting
+	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = wakeKind, wakeAt, wakeDeadline
+	if len(checkpoint) > 0 {
+		sub.Checkpoint = checkpoint
+	}
+	sub.Assignee, sub.LeaseID = "", ""
+	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
+		return nil, err
+	}
+	if err := releaseLease(ctx, tx, leaseID); err != nil {
+		return nil, err
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+		Type: string(mission.EvSuspended),
+		Payload: map[string]any{"state": string(mission.StateWaiting), "wake_kind": wakeKind},
+		Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	sub.Version++
+	return sub, tx.Commit(ctx)
+}
+
+func (s *Store) WakeSubtask(ctx context.Context, id string, expectedVersion int64,
+	actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	sub, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sub.Version != expectedVersion {
+		return nil, store.ErrConflict // CAS 竞争：另一 sweeper/wake 已处理
+	}
+	if _, err := mission.Apply(sub.State, mission.EvWoken); err != nil {
+		return nil, store.ErrConflict
+	}
+	sub.State = mission.StateReady
+	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = "", nil, nil // 一次性注册，清空
+	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
+		return nil, err
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+		Type: string(mission.EvWoken), Payload: map[string]any{"state": string(mission.StateReady)},
+		Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	sub.Version++
+	return sub, tx.Commit(ctx)
+}
+
+func (s *Store) ListWaitingDue(ctx context.Context, now time.Time) ([]*mission.Subtask, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks
+		 WHERE state='WAITING' AND wake_kind='timer' AND wake_at<=$1
+		   AND (wake_deadline IS NULL OR wake_deadline>$1) ORDER BY wake_at`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*mission.Subtask
+	for rows.Next() {
+		sub, err := scanSubtask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sub)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ExpireWakes(ctx context.Context, now time.Time) ([]*mission.Subtask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks
+		 WHERE state='WAITING' AND wake_deadline IS NOT NULL AND wake_deadline<=$1
+		 ORDER BY id FOR UPDATE`, now)
+	if err != nil {
+		return nil, err
+	}
+	var expired []*mission.Subtask
+	for rows.Next() {
+		sub, err := scanSubtask(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		expired = append(expired, sub)
+	}
+	rows.Close()
+
+	for _, sub := range expired {
+		sub.State = mission.StateFailed
+		sub.WakeKind, sub.WakeAt, sub.WakeDeadline = "", nil, nil
+		if err := updateSubtask(ctx, tx, sub, sub.Version, now); err != nil {
+			return nil, err
+		}
+		sub.Version++
+		if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+			Type: string(mission.EvFailed),
+			Payload: map[string]any{"state": string(mission.StateFailed), "reason": "wake_timeout"},
+			Actor: store.Actor{Kind: "system", ID: "sweeper"}, Ts: now}); err != nil {
+			return nil, err
+		}
+	}
+	return expired, tx.Commit(ctx)
+}
+
+func (s *Store) SaveCheckpoint(ctx context.Context, id string, fencingToken int64, checkpoint []byte, _ time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	sub, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := loadActiveLease(ctx, tx, sub, fencingToken); err != nil {
+		return err
+	}
+	if sub.State != mission.StateRunning && sub.State != mission.StateBlocked {
+		return store.ErrConflict
+	}
+	if _, err := tx.Exec(ctx, `UPDATE subtasks SET checkpoint=$1 WHERE id=$2`, checkpoint, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) getSubtask(ctx context.Context, id string) (*mission.Subtask, error) {

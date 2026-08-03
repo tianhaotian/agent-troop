@@ -3,7 +3,7 @@
 多智能体协同平台：跨 Agent 平台（OpenClaw / Hermes / 自研等）的任务拆解、中心化状态管理、调度与人在回路协作。
 
 - **设计文档**：[docs/design/multi-agent-collab-platform-design.md](docs/design/multi-agent-collab-platform-design.md)（22 节 + 附录，含架构、调度、触发体系、协作模式、质量/信誉/仿真/计量专题与技术选型 ADR）
-- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)）
+- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)）
 - **License**：[Apache 2.0](LICENSE)
 
 ## 开发流程约定（重要）
@@ -53,8 +53,33 @@ curl -X POST localhost:8080/v1/missions -d '{
 # 持久化（PG-first）：
 docker compose up -d postgres
 psql postgres://troop:troop@localhost:5432/troop -f migrations/0001_init.sql \
-                                               -f migrations/0002_hitl_board.sql
+                                               -f migrations/0002_hitl_board.sql \
+                                               -f migrations/0003_m3.sql
 TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
+
+# 可选环境变量：TROOP_SCHEDULER=capability-first|round-robin（放置策略，M3）
+#               TROOP_BLOB_DIR=./data/artifacts（Artifact blob 目录）
+```
+
+## M3 API 示例（挂起-唤醒 / 检查点续跑）
+
+```bash
+# 1) progress 心跳携带检查点（fencing 校验；≤64KB 透明载荷，崩溃/换 Agent 后续跑用）
+curl -X POST localhost:8080/v1/subtasks/sub_xxx/progress -d '{
+  "lease_id":"lea_xxx", "fencing_token":3, "checkpoint":{"step":3,"partial":"..."}
+}'
+
+# 2) Agent 挂起自身（RUNNING→WAITING，释放租约；wake_on 必带 TTL 防永久悬挂）
+curl -X POST localhost:8080/v1/subtasks/sub_xxx/suspend -d '{
+  "agent_id":"echo1", "fencing_token":3, "version":4,
+  "wake_on":{"kind":"timer", "at":"2026-08-05T09:00:00Z", "deadline":"2026-08-06T09:00:00Z"},
+  "checkpoint":{"step":3}
+}'
+# timer 到期由 sweeper 唤醒回 READY 重新调度（可换 Agent，offer 里带 checkpoint）；
+# TTL 过期未唤醒 → FAILED(reason=wake_timeout) + 下游级联取消
+
+# 3) 人工唤醒（manual 挂起只能这样醒）
+curl -X POST localhost:8080/v1/subtasks/sub_xxx/wake -d '{"actor_id":"lead"}'
 ```
 
 ## M2 API 示例（人在回路 / 黑板 / Artifact）
@@ -99,5 +124,5 @@ curl localhost:8080/v1/artifacts/art_xxx/content   # 响应头带 X-Artifact-SHA
 
 - **M1 ✅**：任务模型 + PG 中心存储 + DAG 编排 + 通用 HTTP Adapter + Capability-First 调度 + 基础事件流
 - **M2 ✅**：审批门/决策点 + Agent 决策请求 + 决策超时 + 黑板 + Artifact Store（[计划](docs/plan/M2-hitl.md)）
-- **M3（当前）**：策略插件化、Deadline/Cost 调度、检查点续跑、触发体系（挂起-唤醒）
-- **M4**：A2A/MCP 适配、OpenClaw/Hermes 托管 Adapter、Agent 生态接入
+- **M3 ✅**：调度策略插件化（capability-first/round-robin）+ Deadline/Priority 打分 + WAITING 挂起-唤醒（timer/manual + TTL）+ 检查点续跑（[计划](docs/plan/M3-sched-trigger.md)）
+- **M4（当前）**：触发准入管道与 event/condition 唤醒（CEL）、A2A/MCP 适配、OpenClaw/Hermes 托管 Adapter、Agent 生态接入
