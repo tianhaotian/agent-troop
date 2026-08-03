@@ -38,14 +38,18 @@ func main() {
 		log.Printf("store: in-memory (set TROOP_PG_DSN for persistence)")
 	}
 
-	svc := core.New(st, clk, core.DefaultConfig())
+	svc := core.New(st, clk, core.DefaultConfig()).
+		WithBlob(core.FSBlob{Dir: envOr("TROOP_BLOB_DIR", "./data/artifacts")})
 	handler := api.New(svc).Handler()
 
-	// 后台循环：调度器 + 清扫器（轮询间隔为运行机制，非业务时间语义）
+	// 后台循环：调度器 + human 节点工单 + 清扫器（轮询间隔为运行机制，非业务时间语义）
 	stop := make(chan struct{})
 	go loop(stop, 500*time.Millisecond, func() {
 		if _, err := svc.ScheduleOnce(ctx); err != nil {
 			log.Printf("schedule: %v", err)
+		}
+		if _, err := svc.OpenHumanDecisions(ctx); err != nil {
+			log.Printf("open human decisions: %v", err)
 		}
 	})
 	go loop(stop, 5*time.Second, func() {

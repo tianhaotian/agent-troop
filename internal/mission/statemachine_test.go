@@ -30,6 +30,7 @@ func TestApply_LegalTransitions(t *testing.T) {
 
 		// 人工决策（§8）：阻塞 → 批准续跑 / 拒绝失败
 		{StateRunning, EvBlocked, StateBlocked},
+		{StateReady, EvBlocked, StateBlocked}, // human 节点就绪即阻塞（M2-H1）
 		{StateBlocked, EvDecisionApproved, StateRunning},
 		{StateBlocked, EvDecisionRejected, StateFailed},
 

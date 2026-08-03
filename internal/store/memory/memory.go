@@ -18,12 +18,15 @@ import (
 type Store struct {
 	mu sync.Mutex
 
-	missions map[string]*mission.Mission
-	subtasks map[string]*mission.Subtask // by id
-	agents   map[string]*store.Agent
-	leases   map[string]*store.Lease // by id
-	events   []*store.Event
-	idem     map[string]string // key → result
+	missions  map[string]*mission.Mission
+	subtasks  map[string]*mission.Subtask // by id
+	agents    map[string]*store.Agent
+	leases    map[string]*store.Lease // by id
+	events    []*store.Event
+	idem      map[string]string // key → result
+	decisions map[string]*store.Decision
+	board     map[string]*store.BoardEntry // missionID/ns/key
+	artifacts map[string]*store.Artifact
 
 	eventSeq     int64
 	fencingSeq   int64
@@ -36,7 +39,10 @@ func New() *Store {
 		subtasks: map[string]*mission.Subtask{},
 		agents:   map[string]*store.Agent{},
 		leases:   map[string]*store.Lease{},
-		idem:     map[string]string{},
+		idem:      map[string]string{},
+		decisions: map[string]*store.Decision{},
+		board:     map[string]*store.BoardEntry{},
+		artifacts: map[string]*store.Artifact{},
 	}
 }
 
@@ -511,6 +517,214 @@ func (s *Store) ListMissionEvents(_ context.Context, missionID string, afterSeq 
 		}
 	}
 	return out, nil
+}
+
+func (s *Store) BlockSubtask(_ context.Context, id string, fencingToken int64, expectedVersion int64,
+	actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subtasks[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if sub.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	if _, err := s.checkFencingLocked(sub, fencingToken); err != nil {
+		return nil, err
+	}
+	if _, err := mission.Apply(sub.State, mission.EvBlocked); err != nil {
+		return nil, store.ErrConflict
+	}
+	sub.State = mission.StateBlocked
+	sub.Version++
+	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvBlocked),
+		map[string]any{"state": string(mission.StateBlocked)}, actor, now)
+	c := *sub
+	return &c, nil
+}
+
+// ---- 决策 ----
+
+func (s *Store) CreateDecision(_ context.Context, d *store.Decision, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.decisions[d.ID]; ok {
+		return store.ErrConflict
+	}
+	c := *d
+	c.Status = store.DecisionPending
+	c.CreatedAt = now
+	s.decisions[d.ID] = &c
+	s.appendEventLocked(d.SubtaskID, d.MissionID, "decision.requested",
+		map[string]any{"decision_id": d.ID, "question": d.Question, "options": d.Options},
+		store.Actor{Kind: "system", ID: "hitl"}, now)
+	return nil
+}
+
+func (s *Store) GetDecision(_ context.Context, id string) (*store.Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.decisions[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	c := *d
+	return &c, nil
+}
+
+func (s *Store) ListDecisions(_ context.Context, missionID string, pendingOnly bool) ([]*store.Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*store.Decision
+	for _, d := range s.decisions {
+		if missionID != "" && d.MissionID != missionID {
+			continue
+		}
+		if pendingOnly && d.Status != store.DecisionPending {
+			continue
+		}
+		c := *d
+		out = append(out, &c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (s *Store) ResolveDecision(_ context.Context, id, choice, rationale, deciderID string, now time.Time) (*store.Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.decisions[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if d.Status != store.DecisionPending {
+		return nil, store.ErrConflict // 重复裁决/已过期
+	}
+	d.Status = store.DecisionResolved
+	d.Choice = choice
+	d.Rationale = rationale
+	d.DeciderID = deciderID
+	d.ResolvedAt = &now
+	s.appendEventLocked(d.SubtaskID, d.MissionID, "decision.resolved",
+		map[string]any{"decision_id": d.ID, "choice": choice, "decider": deciderID},
+		store.Actor{Kind: "human", ID: deciderID}, now)
+	c := *d
+	return &c, nil
+}
+
+func (s *Store) ExpireDecisions(_ context.Context, now time.Time) ([]*store.Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*store.Decision
+	for _, d := range s.decisions {
+		if d.Status != store.DecisionPending || d.Deadline == nil || d.Deadline.After(now) {
+			continue
+		}
+		switch d.OnTimeout {
+		case "auto_approve", "auto_reject":
+			d.Status = store.DecisionResolved
+			if d.OnTimeout == "auto_approve" {
+				d.Choice = "approve"
+			} else {
+				d.Choice = "reject"
+			}
+			d.DeciderID = "system:timeout"
+			d.ResolvedAt = &now
+		default:
+			d.Status = store.DecisionExpired
+		}
+		s.appendEventLocked(d.SubtaskID, d.MissionID, "decision.expired",
+			map[string]any{"decision_id": d.ID, "on_timeout": d.OnTimeout, "choice": d.Choice},
+			store.Actor{Kind: "system", ID: "decision-sweeper"}, now)
+		c := *d
+		out = append(out, &c)
+	}
+	return out, nil
+}
+
+// ---- 黑板 ----
+
+func boardKey(missionID, ns, key string) string { return missionID + "/" + ns + "/" + key }
+
+func (s *Store) BoardPut(_ context.Context, e *store.BoardEntry, expectedVersion int64, now time.Time) (*store.BoardEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := boardKey(e.MissionID, e.Namespace, e.Key)
+	cur, exists := s.board[k]
+	if expectedVersion >= 0 {
+		var curVer int64 = -1
+		if exists {
+			curVer = cur.Version
+		}
+		if curVer != expectedVersion {
+			return nil, store.ErrConflict
+		}
+	}
+	var newVer int64 = 0
+	if exists {
+		newVer = cur.Version + 1
+	}
+	c := *e
+	c.Version = newVer
+	c.UpdatedAt = now
+	s.board[k] = &c
+	out := c
+	return &out, nil
+}
+
+func (s *Store) BoardGet(_ context.Context, missionID, ns, key string) (*store.BoardEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.board[boardKey(missionID, ns, key)]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	c := *e
+	return &c, nil
+}
+
+func (s *Store) BoardList(_ context.Context, missionID, ns string) ([]*store.BoardEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prefix := missionID + "/" + ns + "/"
+	var out []*store.BoardEntry
+	for k, e := range s.board {
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+			c := *e
+			out = append(out, &c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+// ---- Artifact ----
+
+func (s *Store) PutArtifact(_ context.Context, a *store.Artifact, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.artifacts[a.ID]; ok {
+		return store.ErrConflict
+	}
+	c := *a
+	c.CreatedAt = now
+	s.artifacts[a.ID] = &c
+	s.appendEventLocked(a.ProducedBy, a.MissionID, "artifact.produced",
+		map[string]any{"artifact_id": a.ID, "sha256": a.SHA256, "size": a.Size},
+		store.Actor{Kind: "system", ID: "artifact-store"}, now)
+	return nil
+}
+
+func (s *Store) GetArtifact(_ context.Context, id string) (*store.Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.artifacts[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	c := *a
+	return &c, nil
 }
 
 func (s *Store) appendEventLocked(aggregateID, missionID, typ string, payload map[string]any, actor store.Actor, now time.Time) {

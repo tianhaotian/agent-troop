@@ -28,13 +28,14 @@ func DefaultConfig() Config {
 }
 
 type Service struct {
-	st  store.Store
-	clk clock.Clock
-	cfg Config
+	st   store.Store
+	clk  clock.Clock
+	cfg  Config
+	blob BlobStore
 }
 
 func New(st store.Store, clk clock.Clock, cfg Config) *Service {
-	return &Service{st: st, clk: clk, cfg: cfg}
+	return &Service{st: st, clk: clk, cfg: cfg, blob: NewMemBlob()}
 }
 
 var (
@@ -62,6 +63,10 @@ type TaskSpec struct {
 	Priority       int               `json:"priority,omitempty"`
 	Deadline       *time.Time        `json:"deadline,omitempty"`
 	MaxAttempts    int               `json:"max_attempts,omitempty"` // 0 = 不重试
+	// human 节点（M2）：工单内容与超时策略
+	Question       string            `json:"question,omitempty"`
+	Options        []string          `json:"options,omitempty"`
+	OnTimeout      string            `json:"on_timeout,omitempty"` // auto_approve | auto_reject
 }
 
 // validateDAG 校验：节点名唯一、依赖存在、无环（Kahn 拓扑）。
@@ -138,6 +143,9 @@ func (s *Service) CreateMission(ctx context.Context, owner, goal string, tasks [
 			Scheduling:     mission.SchedulingSpec{Priority: t.Priority, Deadline: t.Deadline},
 			Retry:          mission.RetryPolicy{MaxAttempts: t.MaxAttempts, OnFailure: "retry"},
 			State:          mission.StatePending,
+			Question:       t.Question,
+			Options:        t.Options,
+			OnTimeout:      t.OnTimeout,
 		}
 	}
 	if err := s.st.CreateMission(ctx, m, subs, actor, now); err != nil {
@@ -227,6 +235,38 @@ func (s *Service) propagate(ctx context.Context, completed *mission.Subtask, act
 	return s.deriveMissionStatus(ctx, completed.MissionID)
 }
 
+// cancelUnreachable 子任务永久失败（重试耗尽/人工否决）后调用：
+// 级联取消所有传递依赖它的 PENDING 下游（它们永远不可能就绪），
+// 使 MissionStatusOf 能推导出 FAILED 终态。CANCELLED 的下游自身也作为级联源。
+func (s *Service) cancelUnreachable(ctx context.Context, failed *mission.Subtask, actor store.Actor) error {
+	subs, err := s.st.ListSubtasks(ctx, failed.MissionID)
+	if err != nil {
+		return err
+	}
+	dead := map[string]bool{failed.ID: true}
+	now := s.clk.Now()
+	for changed := true; changed; {
+		changed = false
+		for _, sub := range subs {
+			if sub.State != mission.StatePending || dead[sub.ID] {
+				continue
+			}
+			for _, dep := range sub.DependsOn {
+				if dead[dep] {
+					if _, err := s.st.TransitionSubtask(ctx, sub.ID, mission.EvCancelled, sub.Version,
+						actor, map[string]any{"reason": "upstream failed: " + failed.ID}, now, nil); err != nil {
+						return err
+					}
+					dead[sub.ID] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // deriveMissionStatus 由子任务集合推导并落库 Mission 终态。
 func (s *Service) deriveMissionStatus(ctx context.Context, missionID string) error {
 	subs, err := s.st.ListSubtasks(ctx, missionID)
@@ -272,6 +312,9 @@ func (s *Service) ScheduleOnce(ctx context.Context) (int, error) {
 	now := s.clk.Now()
 	placed := 0
 	for _, sub := range ready {
+		if isHumanKind(sub.Kind) {
+			continue // human 节点由 OpenHumanDecisions 处理，不参与 Agent 放置
+		}
 		best := s.pickAgent(agents, sub)
 		if best == nil {
 			continue // 无合格 Agent：留在 READY 等下轮（M1 不升级）
@@ -423,15 +466,38 @@ func (s *Service) FailSubtask(ctx context.Context, subtaskID string, fencingToke
 			return retried, nil
 		}
 	}
+	// 永久失败：级联取消不可达下游，再推导 Mission 终态
+	if err := s.cancelUnreachable(ctx, sub, actor); err != nil {
+		return sub, err
+	}
 	if err := s.deriveMissionStatus(ctx, sub.MissionID); err != nil {
 		return sub, err
 	}
 	return sub, nil
 }
 
+// ---- 黑板（M2-H4） ----
+
+// BoardPut 写黑板；expectedVersion<0 盲写，>=0 CAS。
+func (s *Service) BoardPut(ctx context.Context, missionID, ns, key string, value []byte, expectedVersion int64) (*store.BoardEntry, error) {
+	if ns == "" || key == "" {
+		return nil, fmt.Errorf("core: board namespace/key required")
+	}
+	e := &store.BoardEntry{MissionID: missionID, Namespace: ns, Key: key, Value: value}
+	return s.st.BoardPut(ctx, e, expectedVersion, s.clk.Now())
+}
+
+func (s *Service) BoardGet(ctx context.Context, missionID, ns, key string) (*store.BoardEntry, error) {
+	return s.st.BoardGet(ctx, missionID, ns, key)
+}
+
+func (s *Service) BoardList(ctx context.Context, missionID, ns string) ([]*store.BoardEntry, error) {
+	return s.st.BoardList(ctx, missionID, ns)
+}
+
 // ---- 清扫器 ----
 
-// SweepOnce 回收到期租约、标记心跳过期 Agent。
+// SweepOnce 回收到期租约、标记心跳过期 Agent、处理到期决策工单（M2-H6）。
 func (s *Service) SweepOnce(ctx context.Context) error {
 	now := s.clk.Now()
 	if _, err := s.st.ExpireLeases(ctx, now); err != nil {
@@ -447,6 +513,19 @@ func (s *Service) SweepOnce(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+	// 到期决策：auto_* 已由 store 落 choice，此处驱动子任务流转
+	expired, err := s.st.ExpireDecisions(ctx, now)
+	if err != nil {
+		return err
+	}
+	for _, d := range expired {
+		if d.Status == store.DecisionResolved {
+			if err := s.applyDecisionOutcome(ctx, d); err != nil {
+				return err
+			}
+		}
+		// status==expired（无 on_timeout 动作）：保持 BLOCKED 等人工干预（M2 边界）
 	}
 	return nil
 }

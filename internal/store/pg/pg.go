@@ -69,12 +69,29 @@ func scanSubtask(row pgx.Row) (*mission.Subtask, error) {
 	}
 	var specObj struct {
 		RequiredSkills []string `json:"required_skills"`
+		Question       string   `json:"question"`
+		Options        []string `json:"options"`
+		OnTimeout      string   `json:"on_timeout"`
 	}
 	_ = json.Unmarshal(spec, &specObj)
 	sub.RequiredSkills = specObj.RequiredSkills
+	sub.Question = specObj.Question
+	sub.Options = specObj.Options
+	sub.OnTimeout = specObj.OnTimeout
 	_ = json.Unmarshal(scheduling, &sub.Scheduling)
 	_ = json.Unmarshal(retry, &sub.Retry)
 	return &sub, nil
+}
+
+// marshalSpec 序列化 subtask spec JSONB（required_skills + human 节点字段）。
+func marshalSpec(sub *mission.Subtask) []byte {
+	spec, _ := json.Marshal(map[string]any{
+		"required_skills": sub.RequiredSkills,
+		"question":        sub.Question,
+		"options":         sub.Options,
+		"on_timeout":      sub.OnTimeout,
+	})
+	return spec
 }
 
 const subtaskCols = `id, mission_id, parent_id, kind, spec, scheduling, retry, state,
@@ -115,7 +132,7 @@ func (s *Store) CreateMission(ctx context.Context, m *mission.Mission, subs []*m
 		return err
 	}
 	for _, sub := range subs {
-		spec, _ := js(map[string]any{"required_skills": sub.RequiredSkills})
+		spec := marshalSpec(sub)
 		scheduling, _ := js(sub.Scheduling)
 		retry, _ := js(sub.Retry)
 		if _, err := tx.Exec(ctx,
@@ -257,7 +274,7 @@ func (s *Store) TransitionSubtask(ctx context.Context, id string, evName mission
 }
 
 func updateSubtask(ctx context.Context, tx pgx.Tx, sub *mission.Subtask, expectedVersion int64, now time.Time) error {
-	spec, _ := js(map[string]any{"required_skills": sub.RequiredSkills})
+	spec := marshalSpec(sub)
 	scheduling, _ := js(sub.Scheduling)
 	retry, _ := js(sub.Retry)
 	tag, err := tx.Exec(ctx,
@@ -700,6 +717,12 @@ func (s *Store) FailSubtask(ctx context.Context, id string, fencingToken int64, 
 	return sub, nil
 }
 
+func (s *Store) BlockSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
+	actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	return s.fencedTransition(ctx, id, fencingToken, expectedVersion, mission.EvBlocked,
+		map[string]any{}, actor, now, nil)
+}
+
 func (s *Store) getSubtask(ctx context.Context, id string) (*mission.Subtask, error) {
 	sub, err := scanSubtask(s.pool.QueryRow(ctx,
 		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1`, id))
@@ -707,6 +730,293 @@ func (s *Store) getSubtask(ctx context.Context, id string) (*mission.Subtask, er
 		return nil, store.ErrNotFound
 	}
 	return sub, err
+}
+
+// ---- 决策（M2） ----
+
+func scanDecision(row pgx.Row) (*store.Decision, error) {
+	var d store.Decision
+	var options []byte
+	var choice, rationale, deciderID *string
+	err := row.Scan(&d.ID, &d.MissionID, &d.SubtaskID, &d.Kind, &d.Question, &options,
+		&d.Status, &choice, &rationale, &deciderID, &d.Deadline, &d.OnTimeout,
+		&d.CreatedAt, &d.ResolvedAt)
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(options, &d.Options)
+	if choice != nil {
+		d.Choice = *choice
+	}
+	if rationale != nil {
+		d.Rationale = *rationale
+	}
+	if deciderID != nil {
+		d.DeciderID = *deciderID
+	}
+	return &d, nil
+}
+
+const decisionCols = `id, mission_id, subtask_id, kind, question, options, status,
+	choice, rationale, decider_id, deadline, on_timeout, ts, resolved_at`
+
+func (s *Store) CreateDecision(ctx context.Context, d *store.Decision, now time.Time) error {
+	options, _ := js(d.Options)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO decisions (id, mission_id, subtask_id, kind, question, options, status,
+		 decider_type, decider_id, deadline, on_timeout, ts)
+		 VALUES ($1,$2,$3,$4,$5,$6,'pending','human',NULL,$7,$8,$9)`,
+		d.ID, d.MissionID, d.SubtaskID, d.Kind, d.Question, options, d.Deadline, d.OnTimeout, now); err != nil {
+		return store.ErrConflict
+	}
+	ev := &store.Event{AggregateID: d.SubtaskID, MissionID: d.MissionID, Type: "decision.requested",
+		Payload: map[string]any{"decision_id": d.ID, "question": d.Question, "options": d.Options},
+		Actor:   store.Actor{Kind: "system", ID: "hitl"}, Ts: now}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) GetDecision(ctx context.Context, id string) (*store.Decision, error) {
+	d, err := scanDecision(s.pool.QueryRow(ctx,
+		`SELECT `+decisionCols+` FROM decisions WHERE id=$1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	return d, err
+}
+
+func (s *Store) ListDecisions(ctx context.Context, missionID string, pendingOnly bool) ([]*store.Decision, error) {
+	q := `SELECT ` + decisionCols + ` FROM decisions WHERE ($1='' OR mission_id=$1)`
+	if pendingOnly {
+		q += ` AND status='pending'`
+	}
+	q += ` ORDER BY ts`
+	rows, err := s.pool.Query(ctx, q, missionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*store.Decision
+	for rows.Next() {
+		d, err := scanDecision(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ResolveDecision(ctx context.Context, id, choice, rationale, deciderID string, now time.Time) (*store.Decision, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx,
+		`UPDATE decisions SET status='resolved', choice=$1, rationale=$2, decider_id=$3, resolved_at=$4
+		 WHERE id=$5 AND status='pending'`, choice, rationale, deciderID, now, id)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, store.ErrConflict
+	}
+	d, err := scanDecision(tx.QueryRow(ctx, `SELECT `+decisionCols+` FROM decisions WHERE id=$1`, id))
+	if err != nil {
+		return nil, err
+	}
+	ev := &store.Event{AggregateID: d.SubtaskID, MissionID: d.MissionID, Type: "decision.resolved",
+		Payload: map[string]any{"decision_id": d.ID, "choice": choice, "decider": deciderID},
+		Actor:   store.Actor{Kind: "human", ID: deciderID}, Ts: now}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return nil, err
+	}
+	return d, tx.Commit(ctx)
+}
+
+func (s *Store) ExpireDecisions(ctx context.Context, now time.Time) ([]*store.Decision, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx,
+		`SELECT `+decisionCols+` FROM decisions
+		 WHERE status='pending' AND deadline IS NOT NULL AND deadline<=$1 FOR UPDATE`, now)
+	if err != nil {
+		return nil, err
+	}
+	var list []*store.Decision
+	for rows.Next() {
+		d, err := scanDecision(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		list = append(list, d)
+	}
+	rows.Close()
+	for _, d := range list {
+		switch d.OnTimeout {
+		case "auto_approve", "auto_reject":
+			choice := "approve"
+			if d.OnTimeout == "auto_reject" {
+				choice = "reject"
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE decisions SET status='resolved', choice=$1, decider_id='system:timeout', resolved_at=$2
+				 WHERE id=$3`, choice, now, d.ID); err != nil {
+				return nil, err
+			}
+			d.Status, d.Choice = store.DecisionResolved, choice
+		default:
+			if _, err := tx.Exec(ctx,
+				`UPDATE decisions SET status='expired' WHERE id=$1`, d.ID); err != nil {
+				return nil, err
+			}
+			d.Status = store.DecisionExpired
+		}
+		ev := &store.Event{AggregateID: d.SubtaskID, MissionID: d.MissionID, Type: "decision.expired",
+			Payload: map[string]any{"decision_id": d.ID, "on_timeout": d.OnTimeout, "choice": d.Choice},
+			Actor:   store.Actor{Kind: "system", ID: "decision-sweeper"}, Ts: now}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return nil, err
+		}
+	}
+	return list, tx.Commit(ctx)
+}
+
+// ---- 黑板（M2） ----
+
+func (s *Store) BoardPut(ctx context.Context, e *store.BoardEntry, expectedVersion int64, now time.Time) (*store.BoardEntry, error) {
+	val, err := js(json.RawMessage(e.Value))
+	if err != nil {
+		return nil, err
+	}
+	if expectedVersion >= 0 {
+		// CAS 路径：仅当现版本匹配才写入
+		tag, err := s.pool.Exec(ctx,
+			`UPDATE board_entries SET value=$1, version=version+1, updated_at=$2
+			 WHERE mission_id=$3 AND namespace=$4 AND key=$5 AND version=$6`,
+			val, now, e.MissionID, e.Namespace, e.Key, expectedVersion)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() == 0 {
+			if expectedVersion == -1 {
+				// 约定 -1 表示"应不存在"，此处不会到达（>=0 分支）
+			}
+			// 可能是新建（expectedVersion 0 且不存在）：尝试插入
+			if _, ierr := s.pool.Exec(ctx,
+				`INSERT INTO board_entries (mission_id, namespace, key, value, version, updated_at)
+				 VALUES ($1,$2,$3,$4,0,$5) ON CONFLICT DO NOTHING`,
+				e.MissionID, e.Namespace, e.Key, val, now); ierr != nil {
+				return nil, ierr
+			}
+			cur, gerr := s.BoardGet(ctx, e.MissionID, e.Namespace, e.Key)
+			if gerr != nil {
+				return nil, gerr
+			}
+			if cur.Version != expectedVersion && !(expectedVersion == 0 && cur.Version == 0) {
+				return nil, store.ErrConflict
+			}
+			return cur, nil
+		}
+		return s.BoardGet(ctx, e.MissionID, e.Namespace, e.Key)
+	}
+	// 盲写（upsert）
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO board_entries (mission_id, namespace, key, value, version, updated_at)
+		 VALUES ($1,$2,$3,$4,0,$5)
+		 ON CONFLICT (mission_id, namespace, key)
+		 DO UPDATE SET value=$4, version=board_entries.version+1, updated_at=$5`,
+		e.MissionID, e.Namespace, e.Key, val, now); err != nil {
+		return nil, err
+	}
+	return s.BoardGet(ctx, e.MissionID, e.Namespace, e.Key)
+}
+
+func (s *Store) BoardGet(ctx context.Context, missionID, ns, key string) (*store.BoardEntry, error) {
+	var e store.BoardEntry
+	var val []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT mission_id, namespace, key, value, version, updated_at FROM board_entries
+		 WHERE mission_id=$1 AND namespace=$2 AND key=$3`, missionID, ns, key).
+		Scan(&e.MissionID, &e.Namespace, &e.Key, &val, &e.Version, &e.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	e.Value = val
+	return &e, err
+}
+
+func (s *Store) BoardList(ctx context.Context, missionID, ns string) ([]*store.BoardEntry, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT mission_id, namespace, key, value, version, updated_at FROM board_entries
+		 WHERE mission_id=$1 AND namespace=$2 ORDER BY key`, missionID, ns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*store.BoardEntry
+	for rows.Next() {
+		var e store.BoardEntry
+		if err := rows.Scan(&e.MissionID, &e.Namespace, &e.Key, &e.Value, &e.Version, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &e)
+	}
+	return out, rows.Err()
+}
+
+// ---- Artifact（M2） ----
+
+func (s *Store) PutArtifact(ctx context.Context, a *store.Artifact, now time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO artifacts (id, sha256, uri, schema_ref, produced_by, mission_id, size, created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		a.ID, a.SHA256, "blob://"+a.SHA256, a.SchemaRef, a.ProducedBy, a.MissionID, a.Size, now); err != nil {
+		return store.ErrConflict
+	}
+	ev := &store.Event{AggregateID: a.ProducedBy, MissionID: a.MissionID, Type: "artifact.produced",
+		Payload: map[string]any{"artifact_id": a.ID, "sha256": a.SHA256, "size": a.Size},
+		Actor:   store.Actor{Kind: "system", ID: "artifact-store"}, Ts: now}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) GetArtifact(ctx context.Context, id string) (*store.Artifact, error) {
+	var a store.Artifact
+	var producedBy, schemaRef *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, sha256, mission_id, produced_by, schema_ref, size, created_at
+		 FROM artifacts WHERE id=$1`, id).
+		Scan(&a.ID, &a.SHA256, &a.MissionID, &producedBy, &schemaRef, &a.Size, &a.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if producedBy != nil {
+		a.ProducedBy = *producedBy
+	}
+	if schemaRef != nil {
+		a.SchemaRef = *schemaRef
+	}
+	return &a, err
 }
 
 // ---- 事件 ----

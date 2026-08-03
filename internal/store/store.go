@@ -73,6 +73,51 @@ const (
 	LeaseFenced   = "FENCED"
 )
 
+// Decision 决策工单（§8.2：审批门 / 决策点；裁决留痕审计）。
+type Decision struct {
+	ID         string     `json:"id"`
+	MissionID  string     `json:"mission_id"`
+	SubtaskID  string     `json:"subtask_id"`
+	Kind       string     `json:"kind"` // approval | decision
+	Question   string     `json:"question"`
+	Options    []string   `json:"options"`
+	Status     string     `json:"status"` // pending | resolved | expired
+	Choice     string     `json:"choice,omitempty"`
+	Rationale  string     `json:"rationale,omitempty"`
+	DeciderID  string     `json:"decider_id,omitempty"`
+	Deadline   *time.Time `json:"deadline,omitempty"`
+	OnTimeout  string     `json:"on_timeout,omitempty"` // auto_approve | auto_reject | ""(none)
+	CreatedAt  time.Time  `json:"created_at"`
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
+}
+
+const (
+	DecisionPending  = "pending"
+	DecisionResolved = "resolved"
+	DecisionExpired  = "expired"
+)
+
+// BoardEntry 黑板条目（§6.2：Mission 级共享上下文，CAS 版本防脏写）。
+type BoardEntry struct {
+	MissionID string    `json:"mission_id"`
+	Namespace string    `json:"namespace"`
+	Key       string    `json:"key"`
+	Value     []byte    `json:"value"`
+	Version   int64     `json:"version"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Artifact 产物注册项（§4.1：内容寻址，blob 本体在 BlobStore）。
+type Artifact struct {
+	ID         string    `json:"id"`
+	SHA256     string    `json:"sha256"`
+	MissionID  string    `json:"mission_id"`
+	ProducedBy string    `json:"produced_by,omitempty"` // subtask id
+	SchemaRef  string    `json:"schema_ref,omitempty"`
+	Size       int64     `json:"size"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 // Store 存储接口。memory 实现用于测试与本地零依赖运行；pg 实现用于真实部署。
 type Store interface {
 	// ---- 任务面 ----
@@ -127,8 +172,31 @@ type Store interface {
 	// FailSubtask 校验 fencing token，RUNNING→FAILED、记录原因、释放租约。
 	FailSubtask(ctx context.Context, id string, fencingToken int64, reason string,
 		expectedVersion int64, actor Actor, now time.Time) (*mission.Subtask, error)
+	// BlockSubtask 校验 fencing token，RUNNING→BLOCKED（Agent 主动请求人决策，M2-H3）。
+	// 注意：BLOCKED 不释放租约——裁决批准后原 Agent 续跑。
+	BlockSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
+		actor Actor, now time.Time) (*mission.Subtask, error)
 
 	// ---- 事件 ----
 	// ListMissionEvents 返回 Mission 及子任务相关事件（SSE 驱动，按 seq 递增）。
 	ListMissionEvents(ctx context.Context, missionID string, afterSeq int64, limit int) ([]*Event, error)
+
+	// ---- 决策（M2） ----
+	CreateDecision(ctx context.Context, d *Decision, now time.Time) error
+	GetDecision(ctx context.Context, id string) (*Decision, error)
+	ListDecisions(ctx context.Context, missionID string, pendingOnly bool) ([]*Decision, error)
+	// ResolveDecision 裁决（CAS：仅 pending 可裁决，重复裁决返回 ErrConflict）。
+	ResolveDecision(ctx context.Context, id, choice, rationale, deciderID string, now time.Time) (*Decision, error)
+	// ExpireDecisions 到期未裁决工单按 on_timeout 处理，返回处理数。
+	ExpireDecisions(ctx context.Context, now time.Time) ([]*Decision, error)
+
+	// ---- 黑板（M2） ----
+	// BoardPut 写黑板；expectedVersion<0 盲写覆盖，>=0 时 CAS（不匹配返回 ErrConflict）。
+	BoardPut(ctx context.Context, e *BoardEntry, expectedVersion int64, now time.Time) (*BoardEntry, error)
+	BoardGet(ctx context.Context, missionID, ns, key string) (*BoardEntry, error)
+	BoardList(ctx context.Context, missionID, ns string) ([]*BoardEntry, error)
+
+	// ---- Artifact（M2） ----
+	PutArtifact(ctx context.Context, a *Artifact, now time.Time) error
+	GetArtifact(ctx context.Context, id string) (*Artifact, error)
 }

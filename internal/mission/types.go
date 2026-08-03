@@ -81,6 +81,10 @@ type Subtask struct {
 	Attempt    int             `json:"attempt"`
 	ResultRef  string          `json:"result_ref,omitempty"`
 	Version    int64           `json:"version"` // 乐观锁（§4.3）
+	// human 节点（M2）：裁决工单的内容与超时策略
+	Question   string          `json:"question,omitempty"`
+	Options    []string        `json:"options,omitempty"`
+	OnTimeout  string          `json:"on_timeout,omitempty"` // auto_approve | auto_reject | ""
 }
 
 // Mission 顶层目标。

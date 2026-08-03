@@ -34,6 +34,7 @@ var transitions = map[State]map[EventType]State{
 	StateReady: {
 		EvLeaseOffered: StateOffered,
 		EvSuspended:    StateWaiting, // 就绪前被挂起（如等待外部条件的计划性挂起）
+		EvBlocked:      StateBlocked, // human 节点就绪后直接阻塞等待人裁决（M2-H1）
 		EvCancelled:    StateCancelled,
 	},
 	StateOffered: {

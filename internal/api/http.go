@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -42,6 +43,21 @@ func (s *Server) Handler() http.Handler {
 	mux.handle("POST /v1/subtasks/{id}/progress", s.progress)
 	mux.handle("POST /v1/subtasks/{id}/complete", s.completeSubtask)
 	mux.handle("POST /v1/subtasks/{id}/fail", s.failSubtask)
+
+	// 人工面（M2）
+	mux.handle("GET /v1/decisions", s.listDecisions)
+	mux.handle("POST /v1/decisions/{id}/resolve", s.resolveDecision)
+	mux.handle("POST /v1/subtasks/{id}/request_decision", s.requestDecision)
+
+	// 黑板（M2）
+	mux.handle("GET /v1/missions/{id}/board/{ns}", s.boardList)
+	mux.handle("GET /v1/missions/{id}/board/{ns}/{key}", s.boardGet)
+	mux.handle("PUT /v1/missions/{id}/board/{ns}/{key}", s.boardPut)
+
+	// Artifact（M2）
+	mux.handle("POST /v1/artifacts", s.putArtifact)
+	mux.handle("GET /v1/artifacts/{id}", s.getArtifact)
+	mux.handle("GET /v1/artifacts/{id}/content", s.getArtifactContent)
 
 	// 最小 Console（S11）
 	mux.handle("GET /", s.console)
@@ -341,4 +357,150 @@ func (s *Server) failSubtask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, sub)
+}
+
+// ---- 人工面（M2） ----
+
+func (s *Server) listDecisions(w http.ResponseWriter, r *http.Request) {
+	missionID := r.URL.Query().Get("mission_id")
+	pendingOnly := r.URL.Query().Get("status") == "pending"
+	ds, err := s.svc.ListDecisions(r.Context(), missionID, pendingOnly)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"decisions": ds})
+}
+
+type resolveReq struct {
+	Choice    string `json:"choice"`
+	Rationale string `json:"rationale,omitempty"`
+	DeciderID string `json:"decider_id"`
+}
+
+func (s *Server) resolveDecision(w http.ResponseWriter, r *http.Request) {
+	var req resolveReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Choice == "" || req.DeciderID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "choice/decider_id required"})
+		return
+	}
+	d, err := s.svc.ResolveDecision(r.Context(), pv(r, "id"), req.Choice, req.Rationale, req.DeciderID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+type requestDecisionReq struct {
+	AgentID      string   `json:"agent_id"`
+	FencingToken int64    `json:"fencing_token"`
+	Version      int64    `json:"version"`
+	Question     string   `json:"question"`
+	Options      []string `json:"options,omitempty"`
+}
+
+func (s *Server) requestDecision(w http.ResponseWriter, r *http.Request) {
+	var req requestDecisionReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Question == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "question required"})
+		return
+	}
+	d, err := s.svc.RequestDecision(r.Context(), pv(r, "id"), req.FencingToken, req.Version,
+		req.AgentID, req.Question, req.Options)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+// ---- 黑板（M2） ----
+
+func (s *Server) boardList(w http.ResponseWriter, r *http.Request) {
+	entries, err := s.svc.BoardList(r.Context(), pv(r, "id"), pv(r, "ns"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
+}
+
+func (s *Server) boardGet(w http.ResponseWriter, r *http.Request) {
+	e, err := s.svc.BoardGet(r.Context(), pv(r, "id"), pv(r, "ns"), pv(r, "key"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, e)
+}
+
+func (s *Server) boardPut(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	expected := int64(-1)
+	if v := r.Header.Get("X-Expected-Version"); v != "" {
+		expected, err = strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad X-Expected-Version"})
+			return
+		}
+	}
+	e, err := s.svc.BoardPut(r.Context(), pv(r, "id"), pv(r, "ns"), pv(r, "key"), body, expected)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, e)
+}
+
+// ---- Artifact（M2） ----
+
+func (s *Server) putArtifact(w http.ResponseWriter, r *http.Request) {
+	missionID := r.Header.Get("X-Mission-ID")
+	if missionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Mission-ID required"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	a, err := s.svc.PutArtifact(r.Context(), missionID,
+		r.Header.Get("X-Produced-By"), r.Header.Get("X-Schema-Ref"), body)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, a)
+}
+
+func (s *Server) getArtifact(w http.ResponseWriter, r *http.Request) {
+	a, err := s.svc.GetArtifact(r.Context(), pv(r, "id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (s *Server) getArtifactContent(w http.ResponseWriter, r *http.Request) {
+	data, a, err := s.svc.GetArtifactContent(r.Context(), pv(r, "id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Artifact-SHA256", a.SHA256)
+	_, _ = w.Write(data)
 }
