@@ -61,6 +61,9 @@ func (s *Server) Handler() http.Handler {
 	mux.handle("GET /v1/artifacts/{id}", s.getArtifact)
 	mux.handle("GET /v1/artifacts/{id}/content", s.getArtifactContent)
 
+	// 触发准入（M4-G3）
+	mux.handle("POST /v1/intents", s.submitIntent)
+
 	// 最小 Console（S11）
 	mux.handle("GET /", s.console)
 	return mux
@@ -315,12 +318,12 @@ func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "renewed"})
 }
 
-// suspendReq M3-T4：Agent 挂起自身（Continuation，§7.3）。
+// suspendReq M3-T4/M4：Agent 挂起自身（Continuation，§7.3）。
 type suspendReq struct {
 	AgentID      string             `json:"agent_id"`
 	FencingToken int64              `json:"fencing_token"`
 	Version      int64              `json:"version"`
-	WakeOn       core.WakeSpec      `json:"wake_on"`
+	WakeOn       mission.WakeSpec   `json:"wake_on"`
 	Checkpoint   json.RawMessage    `json:"checkpoint,omitempty"`
 }
 
@@ -330,7 +333,7 @@ func (s *Server) suspend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sub, err := s.svc.Suspend(r.Context(), pv(r, "id"), req.FencingToken, req.Version,
-		req.AgentID, req.WakeOn, req.Checkpoint)
+		req.AgentID, &req.WakeOn, req.Checkpoint)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -464,6 +467,21 @@ func (s *Server) requestDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
+}
+
+// ---- 触发准入（M4-G3） ----
+
+func (s *Server) submitIntent(w http.ResponseWriter, r *http.Request) {
+	var in core.Intent
+	if !decode(w, r, &in) {
+		return
+	}
+	res, err := s.svc.SubmitIntent(r.Context(), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // ---- 黑板（M2） ----

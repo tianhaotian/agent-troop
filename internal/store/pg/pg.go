@@ -49,7 +49,7 @@ func scanSubtask(row pgx.Row) (*mission.Subtask, error) {
 	var dependsOn []string
 	err := row.Scan(&sub.ID, &sub.MissionID, &parentID, &kind, &spec, &scheduling, &retry,
 		&state, &dependsOn, &assignee, &leaseID, &sub.Attempt, &resultRef, &sub.Version,
-		&sub.Checkpoint, &wakeKind, &sub.WakeAt, &sub.WakeDeadline)
+		&sub.Checkpoint, &wakeKind, &sub.WakeAt, &sub.WakeDeadline, &sub.WakeSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +100,7 @@ func marshalSpec(sub *mission.Subtask) []byte {
 
 const subtaskCols = `id, mission_id, parent_id, kind, spec, scheduling, retry, state,
 	depends_on, assignee_agent_id, lease_id, attempt, result_ref, version,
-	checkpoint, wake_kind, wake_at, wake_deadline`
+	checkpoint, wake_kind, wake_at, wake_deadline, wake_spec`
 
 func appendEvent(ctx context.Context, tx pgx.Tx, e *store.Event) error {
 	payload, err := js(e.Payload)
@@ -285,12 +285,12 @@ func updateSubtask(ctx context.Context, tx pgx.Tx, sub *mission.Subtask, expecte
 	tag, err := tx.Exec(ctx,
 		`UPDATE subtasks SET state=$1, assignee_agent_id=NULLIF($2,''), lease_id=NULLIF($3,''),
 		 attempt=$4, result_ref=NULLIF($5,''), spec=$6, scheduling=$7, retry=$8,
-		 checkpoint=$10, wake_kind=NULLIF($11,''), wake_at=$12, wake_deadline=$13,
+		 checkpoint=$10, wake_kind=NULLIF($11,''), wake_at=$12, wake_deadline=$13, wake_spec=$16,
 		 version=version+1, updated_at=$9
 		 WHERE id=$14 AND version=$15`,
 		string(sub.State), sub.Assignee, sub.LeaseID, sub.Attempt, sub.ResultRef,
 		spec, scheduling, retry, now, sub.Checkpoint, sub.WakeKind, sub.WakeAt, sub.WakeDeadline,
-		sub.ID, expectedVersion)
+		sub.ID, expectedVersion, sub.WakeSpec)
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ func (s *Store) BlockSubtask(ctx context.Context, id string, fencingToken int64,
 // ---- 挂起-唤醒（M3） ----
 
 func (s *Store) SuspendSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
-	wakeKind string, wakeAt, wakeDeadline *time.Time, checkpoint []byte,
+	wake *mission.WakeSpec, checkpoint []byte,
 	actor store.Actor, now time.Time) (*mission.Subtask, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -762,9 +762,14 @@ func (s *Store) SuspendSubtask(ctx context.Context, id string, fencingToken int6
 	if _, err := mission.Apply(sub.State, mission.EvSuspended); err != nil {
 		return nil, store.ErrConflict
 	}
+	spec, err := json.Marshal(wake)
+	if err != nil {
+		return nil, err
+	}
 	leaseID := sub.LeaseID
 	sub.State = mission.StateWaiting
-	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = wakeKind, wakeAt, wakeDeadline
+	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = wake.Kind, wake.At, wake.Deadline
+	sub.WakeSpec = spec
 	if len(checkpoint) > 0 {
 		sub.Checkpoint = checkpoint
 	}
@@ -777,7 +782,7 @@ func (s *Store) SuspendSubtask(ctx context.Context, id string, fencingToken int6
 	}
 	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
 		Type: string(mission.EvSuspended),
-		Payload: map[string]any{"state": string(mission.StateWaiting), "wake_kind": wakeKind},
+		Payload: map[string]any{"state": string(mission.StateWaiting), "wake_kind": wake.Kind},
 		Actor: actor, Ts: now}); err != nil {
 		return nil, err
 	}
@@ -808,7 +813,7 @@ func (s *Store) WakeSubtask(ctx context.Context, id string, expectedVersion int6
 		return nil, store.ErrConflict
 	}
 	sub.State = mission.StateReady
-	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = "", nil, nil // 一次性注册，清空
+	sub.WakeKind, sub.WakeAt, sub.WakeDeadline, sub.WakeSpec = "", nil, nil, nil // 一次性注册，清空
 	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
 		return nil, err
 	}
@@ -868,7 +873,7 @@ func (s *Store) ExpireWakes(ctx context.Context, now time.Time) ([]*mission.Subt
 
 	for _, sub := range expired {
 		sub.State = mission.StateFailed
-		sub.WakeKind, sub.WakeAt, sub.WakeDeadline = "", nil, nil
+		sub.WakeKind, sub.WakeAt, sub.WakeDeadline, sub.WakeSpec = "", nil, nil, nil
 		if err := updateSubtask(ctx, tx, sub, sub.Version, now); err != nil {
 			return nil, err
 		}
@@ -908,6 +913,46 @@ func (s *Store) SaveCheckpoint(ctx context.Context, id string, fencingToken int6
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Store) ListWaiting(ctx context.Context, wakeKind string) ([]*mission.Subtask, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE state='WAITING' AND wake_kind=$1 ORDER BY id`, wakeKind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*mission.Subtask
+	for rows.Next() {
+		sub, err := scanSubtask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sub)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MaxEventSeq(ctx context.Context) (int64, error) {
+	var seq int64
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(seq),0) FROM events`).Scan(&seq)
+	return seq, err
+}
+
+func (s *Store) PutIdempotent(ctx context.Context, key, result string, now time.Time) (string, error) {
+	var existing string
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO idempotency_keys (key, result, created_at) VALUES ($1,$2,$3)
+		 ON CONFLICT (key) DO NOTHING RETURNING result`, key, result, now).Scan(&existing)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 冲突：读出既有值
+		if qerr := s.pool.QueryRow(ctx, `SELECT result FROM idempotency_keys WHERE key=$1`, key).
+			Scan(&existing); qerr != nil {
+			return "", qerr
+		}
+		return existing, store.ErrDuplicate
+	}
+	return "", err
 }
 
 func (s *Store) getSubtask(ctx context.Context, id string) (*mission.Subtask, error) {

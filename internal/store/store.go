@@ -177,12 +177,13 @@ type Store interface {
 	BlockSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
 		actor Actor, now time.Time) (*mission.Subtask, error)
 
-	// ---- 挂起-唤醒（M3，§7.3/§14.4） ----
+	// ---- 挂起-唤醒（M3/M4，§7.3/§14.4） ----
 	// SuspendSubtask 校验 fencing token，RUNNING→WAITING 并**释放租约**
 	// （与 BLOCKED 不同：唤醒后重新调度，可换 Agent 凭 checkpoint 续跑）。
-	// wakeKind/wakeAt/wakeDeadline 落库；checkpoint 非空时一并保存。
+	// wake 为完整唤醒注册（kind/at/deadline 冗余为顶层字段供索引查询）；
+	// checkpoint 非空时一并保存。
 	SuspendSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
-		wakeKind string, wakeAt, wakeDeadline *time.Time, checkpoint []byte,
+		wake *mission.WakeSpec, checkpoint []byte,
 		actor Actor, now time.Time) (*mission.Subtask, error)
 	// WakeSubtask CAS 唤醒 WAITING→READY 并清空 wake 字段（一次性注册语义；
 	// checkpoint 保留供续跑）。版本不匹配返回 ErrConflict（多 sweeper 竞争安全）。
@@ -195,6 +196,14 @@ type Store interface {
 	ExpireWakes(ctx context.Context, now time.Time) ([]*mission.Subtask, error)
 	// SaveCheckpoint progress 心跳携带检查点落库（fencing 校验；不迁移状态、不记事件）。
 	SaveCheckpoint(ctx context.Context, id string, fencingToken int64, checkpoint []byte, now time.Time) error
+	// ListWaiting 按唤醒类型扫描 WAITING 子任务（event/condition 求值用，M4）。
+	ListWaiting(ctx context.Context, wakeKind string) ([]*mission.Subtask, error)
+	// MaxEventSeq 当前事件最大 seq（suspend 注册 event 唤醒的水位线，M4）。
+	MaxEventSeq(ctx context.Context) (int64, error)
+
+	// ---- 幂等键（M4 准入管道复用） ----
+	// PutIdempotent 写入幂等键；键已存在返回 ErrDuplicate（result 为既有值）。
+	PutIdempotent(ctx context.Context, key, result string, now time.Time) (existing string, err error)
 
 	// ---- 事件 ----
 	// ListMissionEvents 返回 Mission 及子任务相关事件（SSE 驱动，按 seq 递增）。

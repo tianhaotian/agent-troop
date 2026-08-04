@@ -3,7 +3,7 @@
 多智能体协同平台：跨 Agent 平台（OpenClaw / Hermes / 自研等）的任务拆解、中心化状态管理、调度与人在回路协作。
 
 - **设计文档**：[docs/design/multi-agent-collab-platform-design.md](docs/design/multi-agent-collab-platform-design.md)（22 节 + 附录，含架构、调度、触发体系、协作模式、质量/信誉/仿真/计量专题与技术选型 ADR）
-- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)）
+- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)、[M4 触发管道](docs/plan/M4-trigger-pipeline.md)）
 - **License**：[Apache 2.0](LICENSE)
 
 ## 开发流程约定（重要）
@@ -54,7 +54,8 @@ curl -X POST localhost:8080/v1/missions -d '{
 docker compose up -d postgres
 psql postgres://troop:troop@localhost:5432/troop -f migrations/0001_init.sql \
                                                -f migrations/0002_hitl_board.sql \
-                                               -f migrations/0003_m3.sql
+                                               -f migrations/0003_m3.sql \
+                                               -f migrations/0004_m4.sql
 TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
 
 # 可选环境变量：TROOP_SCHEDULER=capability-first|round-robin（放置策略，M3）
@@ -80,6 +81,47 @@ curl -X POST localhost:8080/v1/subtasks/sub_xxx/suspend -d '{
 
 # 3) 人工唤醒（manual 挂起只能这样醒）
 curl -X POST localhost:8080/v1/subtasks/sub_xxx/wake -d '{"actor_id":"lead"}'
+```
+
+## M4 API 示例（event/condition 唤醒 / 触发准入）
+
+```bash
+# 1) event 唤醒：挂起等"某类事件到达"（types 过滤 + where 载荷子集等值谓词）
+#    水位线语义：suspend 时平台记录 after_seq，只匹配注册之后到达的同 Mission 事件
+curl -X POST localhost:8080/v1/subtasks/sub_xxx/suspend -d '{
+  "agent_id":"echo1", "fencing_token":3, "version":4,
+  "wake_on":{
+    "kind":"event",
+    "event":{"types":["subtask.succeeded"], "where":{"result_ref":"artifact://a-done"}},
+    "deadline":"2026-08-06T09:00:00Z"
+  }
+}'
+# 事件到达后由 BoardPut 钩子/sweeper 增量评估，命中即 CAS 唤醒（恰好一次）
+
+# 2) condition 唤醒：挂起等黑板条件成立（结构化谓词，CEL 内核槽位预留）
+curl -X POST localhost:8080/v1/subtasks/sub_xxx/suspend -d '{
+  "agent_id":"echo1", "fencing_token":3, "version":4,
+  "wake_on":{
+    "kind":"condition",
+    "condition":{"board":"shared/glossary", "op":"exists"},
+    "deadline":"2026-08-06T09:00:00Z"
+  }
+}'
+# op: exists（键存在即真）| equals（值 JSON 等值，须带 value）；
+# BoardPut 命中即醒，sweeper 全量兜底（anti-entropy）
+
+# 3) 触发准入管道：人/Agent 归一化触发入口（create_mission 幂等去重）
+curl -X POST localhost:8080/v1/intents -d '{
+  "source":{"kind":"agent", "id":"agt_ext"},
+  "action":"create_mission", "idempotency_key":"req-42",
+  "owner":"me", "goal":"demo",
+  "tasks":[{"name":"collect","kind":"agent"}]
+}'
+# → {"mission_id":"msn_xxx"}；重发同键 → 200 + 原 mission_id + "deduplicated":true
+# source 落入 mission.created 事件 actor 留痕；action=wake 可唤醒 WAITING 子任务：
+curl -X POST localhost:8080/v1/intents -d '{
+  "source":{"kind":"human", "id":"lead"}, "action":"wake", "subtask_id":"sub_xxx"
+}'
 ```
 
 ## M2 API 示例（人在回路 / 黑板 / Artifact）
@@ -125,4 +167,5 @@ curl localhost:8080/v1/artifacts/art_xxx/content   # 响应头带 X-Artifact-SHA
 - **M1 ✅**：任务模型 + PG 中心存储 + DAG 编排 + 通用 HTTP Adapter + Capability-First 调度 + 基础事件流
 - **M2 ✅**：审批门/决策点 + Agent 决策请求 + 决策超时 + 黑板 + Artifact Store（[计划](docs/plan/M2-hitl.md)）
 - **M3 ✅**：调度策略插件化（capability-first/round-robin）+ Deadline/Priority 打分 + WAITING 挂起-唤醒（timer/manual + TTL）+ 检查点续跑（[计划](docs/plan/M3-sched-trigger.md)）
-- **M4（当前）**：触发准入管道与 event/condition 唤醒（CEL）、A2A/MCP 适配、OpenClaw/Hermes 托管 Adapter、Agent 生态接入
+- **M4 ✅**：event/condition 唤醒（水位线语义 + 增量评估 + sweeper 兜底）+ TaskIntent 准入管道（/v1/intents 幂等 create_mission / wake）（[计划](docs/plan/M4-trigger-pipeline.md)）
+- **M5（当前）**：CEL 条件内核（cel-go，cost 上限 + 静态引用提取）、scope 三级授权、A2A/MCP 适配、OpenClaw/Hermes 托管 Adapter、Agent 生态接入

@@ -1,15 +1,18 @@
-// 挂起-唤醒（M3-T4，§7.3/§14.4）与检查点续跑（M3-T3，§5.4）。
-// 语义决策见 docs/plan/M3-sched-trigger.md §3：
+// 挂起-唤醒（M3/M4，§7.3/§14.2-14.4）与检查点续跑（§5.4）。
+// 语义决策见 docs/plan/M3-sched-trigger.md §3 与 M4-trigger-pipeline.md §3：
 // - WAITING 释放租约（区别于 BLOCKED 保租约），唤醒后重新调度、可换 Agent 续跑；
-// - wake_on 必带 TTL，过期 FAILED(wake_timeout) + 级联取消下游；
-// - 唤醒一次性：CAS WAITING→READY，醒后注册清空，再等待须重新 suspend。
+// - wake_on 必带 TTL，过期 FAILED(wake_timeout) + 级联取消下游（所有 kind 统一）；
+// - 唤醒一次性：CAS WAITING→READY，醒后注册清空，再等待须重新 suspend；
+// - event 唤醒以事件 seq 水位线界定"注册之后"（重启安全、无时间戳歧义）。
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
+	"reflect"
+	"strings"
 
 	"agenttroop/internal/mission"
 	"agenttroop/internal/store"
@@ -18,22 +21,23 @@ import (
 // MaxCheckpointSize 检查点载荷上限（§3.4：平台只透传不解释）。
 const MaxCheckpointSize = 64 << 10
 
-// WakeSpec suspend 请求的唤醒注册。
-type WakeSpec struct {
-	Kind     string     `json:"kind"` // timer | manual（event/condition 在 M4）
-	At       *time.Time `json:"at,omitempty"`
-	Deadline *time.Time `json:"deadline"` // TTL 必填
-}
-
-func validateWake(w WakeSpec) error {
+func validateWake(w *mission.WakeSpec) error {
 	switch w.Kind {
 	case mission.WakeTimer:
 		if w.At == nil {
 			return fmt.Errorf("core: timer wake requires at")
 		}
 	case mission.WakeManual:
+	case mission.WakeEvent:
+		if w.Event == nil || len(w.Event.Types) == 0 {
+			return fmt.Errorf("core: event wake requires event.types")
+		}
+	case mission.WakeCondition:
+		if err := validateCondition(w.Condition); err != nil {
+			return err
+		}
 	default:
-		return fmt.Errorf("core: unsupported wake kind %q (m3: timer|manual)", w.Kind)
+		return fmt.Errorf("core: unsupported wake kind %q", w.Kind)
 	}
 	if w.Deadline == nil {
 		return fmt.Errorf("core: wake deadline (TTL) is required")
@@ -44,21 +48,48 @@ func validateWake(w WakeSpec) error {
 	return nil
 }
 
+func validateCondition(c *mission.BoardCondition) error {
+	if c == nil {
+		return fmt.Errorf("core: condition wake requires condition")
+	}
+	parts := strings.SplitN(c.Board, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("core: condition.board must be \"namespace/key\"")
+	}
+	switch c.Op {
+	case mission.CondExists:
+	case mission.CondEquals:
+		if c.Value == nil {
+			return fmt.Errorf("core: equals condition requires value")
+		}
+	default:
+		return fmt.Errorf("core: unsupported condition op %q (exists|equals)", c.Op)
+	}
+	return nil
+}
+
 // Suspend Agent 挂起自身：fencing 校验，RUNNING→WAITING，释放租约。
+// event 唤醒在此写入水位线（after_seq = 当前最大事件 seq）。
 func (s *Service) Suspend(ctx context.Context, subtaskID string, fencingToken, version int64,
-	agentID string, wake WakeSpec, checkpoint json.RawMessage) (*mission.Subtask, error) {
+	agentID string, wake *mission.WakeSpec, checkpoint json.RawMessage) (*mission.Subtask, error) {
 	if err := validateWake(wake); err != nil {
 		return nil, err
 	}
 	if len(checkpoint) > MaxCheckpointSize {
 		return nil, fmt.Errorf("core: checkpoint exceeds %d bytes", MaxCheckpointSize)
 	}
-	return s.st.SuspendSubtask(ctx, subtaskID, fencingToken, version,
-		wake.Kind, wake.At, wake.Deadline, checkpoint,
+	if wake.Kind == mission.WakeEvent {
+		seq, err := s.st.MaxEventSeq(ctx)
+		if err != nil {
+			return nil, err
+		}
+		wake.Event.AfterSeq = seq
+	}
+	return s.st.SuspendSubtask(ctx, subtaskID, fencingToken, version, wake, checkpoint,
 		store.Actor{Kind: "agent", ID: agentID}, s.clk.Now())
 }
 
-// Wake 人工唤醒 WAITING 子任务（M3 无鉴权；scope 授权在 M4 准入管道引入）。
+// Wake 人工唤醒 WAITING 子任务（M3 无鉴权；scope 授权在 M5 准入管道引入）。
 func (s *Service) Wake(ctx context.Context, subtaskID, actorID string) (*mission.Subtask, error) {
 	sub, err := s.st.ListSubtasksByState(ctx, mission.StateWaiting)
 	if err != nil {
@@ -88,8 +119,134 @@ func (s *Service) Progress(ctx context.Context, subtaskID, leaseID string, fenci
 	return s.st.SaveCheckpoint(ctx, subtaskID, fencingToken, checkpoint, s.clk.Now())
 }
 
-// sweepWakes SweepOnce 的唤醒段：timer 到期唤醒（CAS，多 sweeper 竞争安全）+
-// TTL 过期置 FAILED 并级联取消下游、推导 Mission 终态。
+// ---- 求值器（G1/G2） ----
+
+// wakeSpecOf 解码子任务的唤醒注册。
+func wakeSpecOf(sub *mission.Subtask) *mission.WakeSpec {
+	if len(sub.WakeSpec) == 0 {
+		return nil
+	}
+	var w mission.WakeSpec
+	if err := json.Unmarshal(sub.WakeSpec, &w); err != nil {
+		return nil
+	}
+	return &w
+}
+
+// matchWhere 子集等值匹配：where 的每个点路径键在载荷中存在且 JSON 等值。
+func matchWhere(payload map[string]any, where map[string]any) bool {
+	for path, want := range where {
+		cur := any(payload)
+		for _, seg := range strings.Split(path, ".") {
+			m, ok := cur.(map[string]any)
+			if !ok {
+				return false
+			}
+			if cur, ok = m[seg]; !ok {
+				return false
+			}
+		}
+		if !reflect.DeepEqual(cur, want) {
+			return false
+		}
+	}
+	return true
+}
+
+// evalEventWakes 事件唤醒评估（edge-fired）：扫描 event 等待的注册，
+// 只匹配水位线之后到达的同 Mission 事件；命中即 CAS 唤醒（恰好一次由 CAS 仲裁）。
+func (s *Service) evalEventWakes(ctx context.Context) error {
+	waiting, err := s.st.ListWaiting(ctx, mission.WakeEvent)
+	if err != nil {
+		return err
+	}
+	for _, sub := range waiting {
+		w := wakeSpecOf(sub)
+		if w == nil || w.Event == nil {
+			continue
+		}
+		evs, err := s.st.ListMissionEvents(ctx, sub.MissionID, w.Event.AfterSeq, 200)
+		if err != nil {
+			return err
+		}
+		for _, e := range evs {
+			matched := false
+			for _, typ := range w.Event.Types {
+				if e.Type == typ {
+					matched = true
+					break
+				}
+			}
+			if !matched || !matchWhere(e.Payload, w.Event.Where) {
+				continue
+			}
+			// CAS 竞争失败说明已被另一路唤醒，直接看下一个注册
+			_, _ = s.st.WakeSubtask(ctx, sub.ID, sub.Version,
+				store.Actor{Kind: "system", ID: "trigger"}, s.clk.Now())
+			break
+		}
+	}
+	return nil
+}
+
+// evalCondition 结构化谓词求值（ConditionEvaluator 的 MVP 内核；CEL 槽位见 M4 计划 §2）。
+func (s *Service) evalCondition(ctx context.Context, missionID string, c *mission.BoardCondition) (bool, error) {
+	parts := strings.SplitN(c.Board, "/", 2)
+	entry, err := s.st.BoardGet(ctx, missionID, parts[0], parts[1])
+	if err != nil {
+		if err == store.ErrNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	if c.Op == mission.CondExists {
+		return true, nil
+	}
+	// equals：JSON 规范化比较（两侧重新编码，map 键排序后字节等值）
+	want, err := json.Marshal(c.Value)
+	if err != nil {
+		return false, err
+	}
+	var gotNorm any
+	if err := json.Unmarshal(entry.Value, &gotNorm); err != nil {
+		return false, nil // 非 JSON 值不等于任何结构化期望值
+	}
+	got, err := json.Marshal(gotNorm)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(want, got), nil
+}
+
+// evalConditionWakes 条件唤醒评估。changedBoard 非空时为增量模式
+// （BoardPut 钩子：只评估该 Mission 内引用该 ns/key 的注册）；为空为全量兜底（sweeper）。
+func (s *Service) evalConditionWakes(ctx context.Context, missionID, changedBoard string) error {
+	waiting, err := s.st.ListWaiting(ctx, mission.WakeCondition)
+	if err != nil {
+		return err
+	}
+	for _, sub := range waiting {
+		w := wakeSpecOf(sub)
+		if w == nil || w.Condition == nil {
+			continue
+		}
+		if changedBoard != "" && (sub.MissionID != missionID || w.Condition.Board != changedBoard) {
+			continue
+		}
+		ok, err := s.evalCondition(ctx, sub.MissionID, w.Condition)
+		if err != nil {
+			return err
+		}
+		if ok {
+			_, _ = s.st.WakeSubtask(ctx, sub.ID, sub.Version,
+				store.Actor{Kind: "system", ID: "trigger"}, s.clk.Now())
+		}
+	}
+	return nil
+}
+
+// sweepWakes SweepOnce 的唤醒段：timer 到期唤醒 + event/condition 全量兜底评估 +
+// TTL 过期置 FAILED 并级联取消下游、推导 Mission 终态。所有 CAS 竞争安全。
 func (s *Service) sweepWakes(ctx context.Context) error {
 	now := s.clk.Now()
 	due, err := s.st.ListWaitingDue(ctx, now)
@@ -100,6 +257,12 @@ func (s *Service) sweepWakes(ctx context.Context) error {
 		// 冲突忽略：另一 sweeper 已唤醒（恰好一次由 CAS 保证）
 		_, _ = s.st.WakeSubtask(ctx, sub.ID, sub.Version,
 			store.Actor{Kind: "system", ID: "trigger"}, now)
+	}
+	if err := s.evalEventWakes(ctx); err != nil {
+		return err
+	}
+	if err := s.evalConditionWakes(ctx, "", ""); err != nil { // anti-entropy 兜底
+		return err
 	}
 	expired, err := s.st.ExpireWakes(ctx, now)
 	if err != nil {

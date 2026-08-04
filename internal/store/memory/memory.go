@@ -7,6 +7,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"sync"
 	"time"
@@ -548,7 +549,7 @@ func (s *Store) BlockSubtask(_ context.Context, id string, fencingToken int64, e
 // ---- 挂起-唤醒（M3） ----
 
 func (s *Store) SuspendSubtask(_ context.Context, id string, fencingToken int64, expectedVersion int64,
-	wakeKind string, wakeAt, wakeDeadline *time.Time, checkpoint []byte,
+	wake *mission.WakeSpec, checkpoint []byte,
 	actor store.Actor, now time.Time) (*mission.Subtask, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -566,8 +567,13 @@ func (s *Store) SuspendSubtask(_ context.Context, id string, fencingToken int64,
 	if _, err := mission.Apply(sub.State, mission.EvSuspended); err != nil {
 		return nil, store.ErrConflict
 	}
+	spec, err := json.Marshal(wake)
+	if err != nil {
+		return nil, err
+	}
 	sub.State = mission.StateWaiting
-	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = wakeKind, wakeAt, wakeDeadline
+	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = wake.Kind, wake.At, wake.Deadline
+	sub.WakeSpec = spec
 	if len(checkpoint) > 0 {
 		sub.Checkpoint = append([]byte(nil), checkpoint...)
 	}
@@ -576,7 +582,7 @@ func (s *Store) SuspendSubtask(_ context.Context, id string, fencingToken int64,
 	sub.Assignee, sub.LeaseID = "", ""
 	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvSuspended), map[string]any{
 		"state":    string(mission.StateWaiting),
-		"wake_kind": wakeKind,
+		"wake_kind": wake.Kind,
 	}, actor, now)
 	c := *sub
 	return &c, nil
@@ -597,7 +603,7 @@ func (s *Store) WakeSubtask(_ context.Context, id string, expectedVersion int64,
 		return nil, store.ErrConflict
 	}
 	sub.State = mission.StateReady
-	sub.WakeKind, sub.WakeAt, sub.WakeDeadline = "", nil, nil // 一次性注册，清空
+	sub.WakeKind, sub.WakeAt, sub.WakeDeadline, sub.WakeSpec = "", nil, nil, nil // 一次性注册，清空
 	sub.Version++
 	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvWoken),
 		map[string]any{"state": string(mission.StateReady)}, actor, now)
@@ -629,7 +635,7 @@ func (s *Store) ExpireWakes(_ context.Context, now time.Time) ([]*mission.Subtas
 			continue
 		}
 		sub.State = mission.StateFailed
-		sub.WakeKind, sub.WakeAt, sub.WakeDeadline = "", nil, nil
+		sub.WakeKind, sub.WakeAt, sub.WakeDeadline, sub.WakeSpec = "", nil, nil, nil
 		sub.Version++
 		s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvFailed), map[string]any{
 			"state":  string(mission.StateFailed),
@@ -656,6 +662,37 @@ func (s *Store) SaveCheckpoint(_ context.Context, id string, fencingToken int64,
 	}
 	sub.Checkpoint = append([]byte(nil), checkpoint...)
 	return nil
+}
+
+func (s *Store) ListWaiting(_ context.Context, wakeKind string) ([]*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*mission.Subtask
+	for _, sub := range s.subtasks {
+		if sub.State == mission.StateWaiting && sub.WakeKind == wakeKind {
+			c := *sub
+			out = append(out, &c)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) MaxEventSeq(_ context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.eventSeq, nil
+}
+
+// ---- 幂等键 ----
+
+func (s *Store) PutIdempotent(_ context.Context, key, result string, _ time.Time) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, dup := s.idem[key]; dup {
+		return existing, store.ErrDuplicate
+	}
+	s.idem[key] = result
+	return "", nil
 }
 
 // ---- 决策 ----

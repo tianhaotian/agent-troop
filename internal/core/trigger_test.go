@@ -46,7 +46,7 @@ func TestSuspendTimerWakeResume(t *testing.T) {
 	wakeAt := clk.Now().Add(10 * time.Minute)
 	ttl := clk.Now().Add(time.Hour)
 	suspended, err := s.Suspend(ctx, sub.ID, token, sub.Version, "agt_a",
-		WakeSpec{Kind: mission.WakeTimer, At: &wakeAt, Deadline: &ttl},
+		&mission.WakeSpec{Kind: mission.WakeTimer, At: &wakeAt, Deadline: &ttl},
 		json.RawMessage(`{"progress": 42}`))
 	if err != nil {
 		t.Fatalf("Suspend: %v", err)
@@ -116,7 +116,7 @@ func TestManualWake(t *testing.T) {
 	sub, token := startOne(t, s, "agt_a")
 	ttl := clk.Now().Add(time.Hour)
 	if _, err := s.Suspend(ctx, sub.ID, token, sub.Version, "agt_a",
-		WakeSpec{Kind: mission.WakeManual, Deadline: &ttl}, nil); err != nil {
+		&mission.WakeSpec{Kind: mission.WakeManual, Deadline: &ttl}, nil); err != nil {
 		t.Fatalf("Suspend: %v", err)
 	}
 	// manual 不被 sweeper 唤醒
@@ -152,7 +152,7 @@ func TestWakeTimeoutFailsMission(t *testing.T) {
 	wakeAt := clk.Now().Add(10 * time.Minute)
 	ttl := clk.Now().Add(time.Hour)
 	if _, err := s.Suspend(ctx, sub.ID, token, sub.Version, "agt_a",
-		WakeSpec{Kind: mission.WakeTimer, At: &wakeAt, Deadline: &ttl}, nil); err != nil {
+		&mission.WakeSpec{Kind: mission.WakeTimer, At: &wakeAt, Deadline: &ttl}, nil); err != nil {
 		t.Fatalf("Suspend: %v", err)
 	}
 	// timer 到期但 sweeper 未跑；直接越过 TTL → FAILED(wake_timeout)
@@ -183,19 +183,19 @@ func TestSuspendValidation(t *testing.T) {
 	sub, token := startOne(t, s, "agt_a")
 	ttl := clk.Now().Add(time.Hour)
 	if _, err := s.Suspend(ctx, sub.ID, token, sub.Version, "agt_a",
-		WakeSpec{Kind: mission.WakeTimer, Deadline: &ttl}, nil); err == nil {
+		&mission.WakeSpec{Kind: mission.WakeTimer, Deadline: &ttl}, nil); err == nil {
 		t.Fatal("timer without at must error")
 	}
 	if _, err := s.Suspend(ctx, sub.ID, token, sub.Version, "agt_a",
-		WakeSpec{Kind: mission.WakeManual}, nil); err == nil {
+		&mission.WakeSpec{Kind: mission.WakeManual}, nil); err == nil {
 		t.Fatal("missing TTL must error")
 	}
 	if _, err := s.Suspend(ctx, sub.ID, token, sub.Version, "agt_a",
-		WakeSpec{Kind: "event", Deadline: &ttl}, nil); err == nil {
-		t.Fatal("event kind deferred to M4, must error")
+		&mission.WakeSpec{Kind: mission.WakeEvent, Deadline: &ttl}, nil); err == nil {
+		t.Fatal("event wake without types must error")
 	}
 	if _, err := s.Suspend(ctx, sub.ID, token+1, sub.Version, "agt_a",
-		WakeSpec{Kind: mission.WakeManual, Deadline: &ttl}, nil); !errors.Is(err, store.ErrFenced) {
+		&mission.WakeSpec{Kind: mission.WakeManual, Deadline: &ttl}, nil); !errors.Is(err, store.ErrFenced) {
 		t.Fatalf("bad token must fence, got %v", err)
 	}
 }

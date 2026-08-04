@@ -128,12 +128,17 @@ func validateDAG(tasks []TaskSpec) error {
 
 // CreateMission 落库（全部 PENDING）后把根节点推进 READY。
 func (s *Service) CreateMission(ctx context.Context, owner, goal string, tasks []TaskSpec) (*mission.Mission, error) {
+	return s.createMission(ctx, newID("msn"), store.Actor{Kind: "human", ID: owner}, owner, goal, tasks)
+}
+
+// createMission 带预定 ID 与触发者的创建（M4 准入管道：幂等占位需先定 ID，
+// actor 为 intent source，落创建事件留痕）。
+func (s *Service) createMission(ctx context.Context, id string, actor store.Actor, owner, goal string, tasks []TaskSpec) (*mission.Mission, error) {
 	if err := validateDAG(tasks); err != nil {
 		return nil, err
 	}
 	now := s.clk.Now()
-	actor := store.Actor{Kind: "human", ID: owner}
-	m := &mission.Mission{ID: newID("msn"), Owner: owner, Goal: goal, Status: mission.MissionActive}
+	m := &mission.Mission{ID: id, Owner: owner, Goal: goal, Status: mission.MissionActive}
 
 	subs := make([]*mission.Subtask, len(tasks))
 	for i, t := range tasks {
@@ -414,7 +419,13 @@ func (s *Service) BoardPut(ctx context.Context, missionID, ns, key string, value
 		return nil, fmt.Errorf("core: board namespace/key required")
 	}
 	e := &store.BoardEntry{MissionID: missionID, Namespace: ns, Key: key, Value: value}
-	return s.st.BoardPut(ctx, e, expectedVersion, s.clk.Now())
+	entry, err := s.st.BoardPut(ctx, e, expectedVersion, s.clk.Now())
+	if err != nil {
+		return nil, err
+	}
+	// M4-G2：黑板写入增量评估条件唤醒（全量兜底在 sweeper；失败不影响写入本身）
+	_ = s.evalConditionWakes(ctx, missionID, ns+"/"+key)
+	return entry, nil
 }
 
 func (s *Service) BoardGet(ctx context.Context, missionID, ns, key string) (*store.BoardEntry, error) {

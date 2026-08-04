@@ -88,17 +88,49 @@ type Subtask struct {
 	Question   string          `json:"question,omitempty"`
 	Options    []string        `json:"options,omitempty"`
 	OnTimeout  string          `json:"on_timeout,omitempty"` // auto_approve | auto_reject | ""
-	// Continuation（M3，§7.3）：挂起-唤醒与检查点续跑
-	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"`   // 透明载荷（≤64KB），续跑 Agent 自行解释
-	WakeKind     string          `json:"wake_kind,omitempty"`    // timer | manual
-	WakeAt       *time.Time      `json:"wake_at,omitempty"`      // timer 唤醒时刻
+	// Continuation（M3/M4，§7.3）：挂起-唤醒与检查点续跑
+	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"`    // 透明载荷（≤64KB），续跑 Agent 自行解释
+	WakeKind     string          `json:"wake_kind,omitempty"`     // timer | manual | event | condition
+	WakeAt       *time.Time      `json:"wake_at,omitempty"`       // timer 唤醒时刻
 	WakeDeadline *time.Time      `json:"wake_deadline,omitempty"` // 唤醒注册 TTL（必填，过期 FAILED）
+	WakeSpec     json.RawMessage `json:"wake_spec,omitempty"`     // 完整唤醒注册（event/condition 参数，求值用）
 }
 
-// Wake 类型常量（§7.3；event/condition 在 M4 引入）。
+// Wake 类型常量（§7.3）。
 const (
-	WakeTimer  = "timer"
-	WakeManual = "manual"
+	WakeTimer     = "timer"
+	WakeManual    = "manual"
+	WakeEvent     = "event"     // M4：事件唤醒（§14.2 单事件模式）
+	WakeCondition = "condition" // M4：条件唤醒（§14.3 结构化谓词，CEL 槽位预留）
+)
+
+// WakeSpec 一次性唤醒注册（§7.3/§14.4：level-triggered、edge-fired、TTL 必填）。
+type WakeSpec struct {
+	Kind      string          `json:"kind"` // timer | manual | event | condition
+	At        *time.Time      `json:"at,omitempty"`
+	Deadline  *time.Time      `json:"deadline"` // TTL（防永久悬挂）
+	Event     *EventMatch     `json:"event,omitempty"`
+	Condition *BoardCondition `json:"condition,omitempty"`
+}
+
+// EventMatch 单事件模式（§14.2 规则 1）：类型过滤 + 载荷子集等值谓词。
+type EventMatch struct {
+	Types    []string       `json:"types"`
+	Where    map[string]any `json:"where,omitempty"` // 点路径下钻载荷，全部键等值才命中
+	AfterSeq int64          `json:"after_seq"`       // 水位线：注册时平台写入，只匹配其后到达的事件
+}
+
+// BoardCondition 黑板条件谓词（M4 MVP；CEL 内核经 ConditionEvaluator 槽位替换）。
+type BoardCondition struct {
+	Board string `json:"board"` // "namespace/key"
+	Op    string `json:"op"`    // exists | equals
+	Value any    `json:"value,omitempty"`
+}
+
+// 条件操作常量。
+const (
+	CondExists = "exists"
+	CondEquals = "equals"
 )
 
 // Mission 顶层目标。
