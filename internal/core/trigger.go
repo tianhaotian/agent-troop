@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -52,6 +53,24 @@ func validateCondition(c *mission.BoardCondition) error {
 	if c == nil {
 		return fmt.Errorf("core: condition wake requires condition")
 	}
+	// M5 §3.1：expr 与结构化谓词互斥——同现或同缺均拒绝
+	hasExpr := c.Expr != ""
+	hasStruct := c.Board != "" || c.Op != ""
+	if hasExpr && hasStruct {
+		return fmt.Errorf("%w: expr and board/op are mutually exclusive", ErrInvalidCondition)
+	}
+	if hasExpr {
+		cc, err := compileConditionExpr(c.Expr)
+		if err != nil {
+			return err
+		}
+		// 引用键集随 wake_spec 持久化（增量过滤与可观测性用）
+		c.Refs, c.RefsWildcard = cc.refs, cc.wildcard
+		return nil
+	}
+	if !hasStruct {
+		return fmt.Errorf("core: condition requires expr or board/op")
+	}
 	parts := strings.SplitN(c.Board, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return fmt.Errorf("core: condition.board must be \"namespace/key\"")
@@ -85,8 +104,10 @@ func (s *Service) Suspend(ctx context.Context, subtaskID string, fencingToken, v
 		}
 		wake.Event.AfterSeq = seq
 	}
+	now := s.clk.Now()
+	wake.RegisteredAt = &now // CEL elapsed() 基准（§14.3 逻辑时钟注入）
 	return s.st.SuspendSubtask(ctx, subtaskID, fencingToken, version, wake, checkpoint,
-		store.Actor{Kind: "agent", ID: agentID}, s.clk.Now())
+		store.Actor{Kind: "agent", ID: agentID}, now)
 }
 
 // Wake 人工唤醒 WAITING 子任务（M3 无鉴权；scope 授权在 M5 准入管道引入）。
@@ -189,8 +210,17 @@ func (s *Service) evalEventWakes(ctx context.Context) error {
 	return nil
 }
 
-// evalCondition 结构化谓词求值（ConditionEvaluator 的 MVP 内核；CEL 槽位见 M4 计划 §2）。
-func (s *Service) evalCondition(ctx context.Context, missionID string, c *mission.BoardCondition) (bool, error) {
+// evalCondition 条件求值分发（M5-H1）：expr 走 CEL 内核，否则走结构化谓词
+//（M4 路径，行为逐字节不变）。
+func (s *Service) evalCondition(ctx context.Context, sub *mission.Subtask, w *mission.WakeSpec) (bool, error) {
+	if w.Condition.Expr != "" {
+		return s.evalConditionExpr(ctx, sub, w)
+	}
+	return s.evalStructuredCondition(ctx, sub.MissionID, w.Condition)
+}
+
+// evalStructuredCondition 结构化谓词求值（exists/equals，M4）。
+func (s *Service) evalStructuredCondition(ctx context.Context, missionID string, c *mission.BoardCondition) (bool, error) {
 	parts := strings.SplitN(c.Board, "/", 2)
 	entry, err := s.st.BoardGet(ctx, missionID, parts[0], parts[1])
 	if err != nil {
@@ -218,6 +248,21 @@ func (s *Service) evalCondition(ctx context.Context, missionID string, c *missio
 	return bytes.Equal(want, got), nil
 }
 
+// conditionRefsChanged 增量过滤（M5 §3.6）：changedBoard 是否影响该注册。
+// 结构化谓词按键等值比对；CEL 注册按静态引用键集比对，wildcard/提取失败恒真。
+// 只引用 mission.*/subtask.*/时钟函数的注册键集为空——BoardPut 不改变这些输入，
+// 增量评估跳过，由 sweeper 全量兜底（§14.4 level-triggered 语义由兜底保证）。
+func conditionRefsChanged(c *mission.BoardCondition, changedBoard string) bool {
+	if c.Expr == "" {
+		return c.Board == changedBoard
+	}
+	cc, err := compileConditionExpr(c.Expr)
+	if err != nil {
+		return true // 无法判定：宁多评不漏评
+	}
+	return cc.referencesBoard(changedBoard)
+}
+
 // evalConditionWakes 条件唤醒评估。changedBoard 非空时为增量模式
 // （BoardPut 钩子：只评估该 Mission 内引用该 ns/key 的注册）；为空为全量兜底（sweeper）。
 func (s *Service) evalConditionWakes(ctx context.Context, missionID, changedBoard string) error {
@@ -230,10 +275,24 @@ func (s *Service) evalConditionWakes(ctx context.Context, missionID, changedBoar
 		if w == nil || w.Condition == nil {
 			continue
 		}
-		if changedBoard != "" && (sub.MissionID != missionID || w.Condition.Board != changedBoard) {
+		if changedBoard != "" && (sub.MissionID != missionID || !conditionRefsChanged(w.Condition, changedBoard)) {
 			continue
 		}
-		ok, err := s.evalCondition(ctx, sub.MissionID, w.Condition)
+		ok, err := s.evalCondition(ctx, sub, w)
+		if errors.Is(err, errConditionCostExceeded) {
+			// §14.3"超限视为 false 并告警"：不唤醒，落事件留痕
+			_ = s.st.AppendEvent(ctx, &store.Event{
+				AggregateID: sub.ID, MissionID: sub.MissionID,
+				Type: "condition.cost_exceeded",
+				Payload: map[string]any{
+					"subtask_id": sub.ID, "expr": w.Condition.Expr,
+					"limit": MaxConditionRuntimeCost,
+				},
+				Actor: store.Actor{Kind: "system", ID: "trigger"},
+				Ts:    s.clk.Now(),
+			})
+			continue
+		}
 		if err != nil {
 			return err
 		}

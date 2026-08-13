@@ -106,11 +106,12 @@ const (
 
 // WakeSpec 一次性唤醒注册（§7.3/§14.4：level-triggered、edge-fired、TTL 必填）。
 type WakeSpec struct {
-	Kind      string          `json:"kind"` // timer | manual | event | condition
-	At        *time.Time      `json:"at,omitempty"`
-	Deadline  *time.Time      `json:"deadline"` // TTL（防永久悬挂）
-	Event     *EventMatch     `json:"event,omitempty"`
-	Condition *BoardCondition `json:"condition,omitempty"`
+	Kind         string          `json:"kind"` // timer | manual | event | condition
+	At           *time.Time      `json:"at,omitempty"`
+	Deadline     *time.Time      `json:"deadline"` // TTL（防永久悬挂）
+	RegisteredAt *time.Time      `json:"registered_at,omitempty"` // 注册时刻（平台写入；CEL elapsed() 基准）
+	Event        *EventMatch     `json:"event,omitempty"`
+	Condition    *BoardCondition `json:"condition,omitempty"`
 }
 
 // EventMatch 单事件模式（§14.2 规则 1）：类型过滤 + 载荷子集等值谓词。
@@ -120,11 +121,19 @@ type EventMatch struct {
 	AfterSeq int64          `json:"after_seq"`       // 水位线：注册时平台写入，只匹配其后到达的事件
 }
 
-// BoardCondition 黑板条件谓词（M4 MVP；CEL 内核经 ConditionEvaluator 槽位替换）。
+// BoardCondition 黑板条件谓词。两种互斥形态（M5 §3.1）：
+//   - 结构化谓词（M4）：Board + Op(+Value)，求值器语义不变；
+//   - CEL 表达式（M5-H1）：Expr，数据模型 board.<ns>.<key> / mission.* / subtask.* /
+//     elapsed() / deadline_in()（§14.3）。
+// Refs/RefsWildcard 为注册时静态提取的 board 引用键集（"ns/key"，"ns/*" 表整命名空间），
+// 供 BoardPut 增量评估过滤；提取遇动态下标等不可判定形态置 RefsWildcard（宁多评不漏评）。
 type BoardCondition struct {
-	Board string `json:"board"` // "namespace/key"
-	Op    string `json:"op"`    // exists | equals
-	Value any    `json:"value,omitempty"`
+	Board        string   `json:"board,omitempty"` // "namespace/key"
+	Op           string   `json:"op,omitempty"`    // exists | equals
+	Value        any      `json:"value,omitempty"`
+	Expr         string   `json:"expr,omitempty"`          // CEL 表达式（与 Board/Op 互斥）
+	Refs         []string `json:"refs,omitempty"`          // 静态引用键集（平台注册时填充）
+	RefsWildcard bool     `json:"refs_wildcard,omitempty"` // 引用不可静态判定：增量评估恒包含
 }
 
 // 条件操作常量。

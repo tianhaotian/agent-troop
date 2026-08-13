@@ -25,12 +25,20 @@ func newService() (*Service, *memory.Store, *clock.FakeClock) {
 
 func mustRegister(t *testing.T, s *Service, id string, maxConc int, skills ...string) {
 	t.Helper()
+	mustRegisterScopes(t, s, id, nil, maxConc, skills...)
+}
+
+// mustRegisterScopes 注册带触发授权的 Agent（M5-H2：scope 默认收紧，
+// 经 /v1/intents 触发的 Agent 须显式声明 trigger.* scope）。
+func mustRegisterScopes(t *testing.T, s *Service, id string, scopes []string, maxConc int, skills ...string) {
+	t.Helper()
 	caps := make([]store.Capability, len(skills))
 	for i, sk := range skills {
 		caps[i] = store.Capability{Skill: sk, Level: 0.9}
 	}
 	if err := s.RegisterAgent(ctx, &store.Agent{
 		ID: id, Name: id, Platform: "http-echo", Capabilities: caps, MaxConcurrency: maxConc,
+		TriggerScopes: scopes,
 	}); err != nil {
 		t.Fatalf("RegisterAgent: %v", err)
 	}

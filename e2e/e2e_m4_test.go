@@ -159,6 +159,11 @@ func TestE2EIntentIdempotent(t *testing.T) {
 	defer srv.Close()
 	base = srv.URL
 
+	// M5-H2：agent source 须注册且持有 trigger.create_mission scope
+	do(t, "POST", "/v1/agents/register", map[string]any{
+		"id": "agt_ext", "name": "agt_ext", "platform": "custom",
+		"trigger_scopes": []string{"trigger.create_mission"},
+	}, 200)
 	body := map[string]any{
 		"source":          map[string]any{"kind": "agent", "id": "agt_ext"},
 		"action":          "create_mission",

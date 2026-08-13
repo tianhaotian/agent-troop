@@ -838,7 +838,10 @@ func (s *Store) BoardGet(_ context.Context, missionID, ns, key string) (*store.B
 func (s *Store) BoardList(_ context.Context, missionID, ns string) ([]*store.BoardEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prefix := missionID + "/" + ns + "/"
+	prefix := missionID + "/"
+	if ns != "" {
+		prefix += ns + "/"
+	} // 空 ns = 全命名空间（M5：CEL wildcard 注册的 board 视图）
 	var out []*store.BoardEntry
 	for k, e := range s.board {
 		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
@@ -889,6 +892,14 @@ func (s *Store) appendEventLocked(aggregateID, missionID, typ string, payload ma
 		Actor:       actor,
 		Ts:          now,
 	})
+}
+
+// AppendEvent 追加独立事件（M5：condition.cost_exceeded 等平台留痕）。
+func (s *Store) AppendEvent(_ context.Context, e *store.Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appendEventLocked(e.AggregateID, e.MissionID, e.Type, e.Payload, e.Actor, e.Ts)
+	return nil
 }
 
 func leaseID(n int64) string {

@@ -87,6 +87,10 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "fenced: stale fencing token"})
 	case errors.Is(err, core.ErrInvalidDAG):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, core.ErrInvalidCondition):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()}) // M5：CEL 注册校验
+	case errors.Is(err, core.ErrForbidden):
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()}) // M5：触发 scope 鉴权
 	default:
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
@@ -207,6 +211,8 @@ type registerAgentReq struct {
 	Endpoint       map[string]string  `json:"endpoint,omitempty"`
 	Capabilities   []store.Capability `json:"capabilities"`
 	MaxConcurrency int                `json:"max_concurrency,omitempty"`
+	// TriggerScopes M5-H2：触发授权（§7.4；缺省 [] 默认收紧）
+	TriggerScopes  []string           `json:"trigger_scopes,omitempty"`
 }
 
 func (s *Server) registerAgent(w http.ResponseWriter, r *http.Request) {
@@ -221,6 +227,7 @@ func (s *Server) registerAgent(w http.ResponseWriter, r *http.Request) {
 	a := &store.Agent{
 		ID: req.ID, Name: req.Name, Platform: req.Platform, Endpoint: req.Endpoint,
 		Capabilities: req.Capabilities, MaxConcurrency: req.MaxConcurrency,
+		TriggerScopes: req.TriggerScopes,
 	}
 	if err := s.svc.RegisterAgent(r.Context(), a); err != nil {
 		writeErr(w, err)

@@ -11,6 +11,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -29,16 +31,23 @@ func testStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	// 应用迁移 + 清场（测试库专用！）
-	mig, err := os.ReadFile("../../../migrations/0001_init.sql")
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
+	// 应用全部迁移（按文件名序）+ 清场（测试库专用！）
+	migs, err := filepath.Glob("../../../migrations/*.sql")
+	if err != nil || len(migs) == 0 {
+		t.Fatalf("glob migrations: %v", err)
 	}
-	if _, err := st.pool.Exec(ctx, string(mig)); err != nil {
-		t.Fatalf("migrate: %v", err)
+	sort.Strings(migs)
+	for _, f := range migs {
+		mig, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read migration %s: %v", f, err)
+		}
+		if _, err := st.pool.Exec(ctx, string(mig)); err != nil {
+			t.Fatalf("migrate %s: %v", f, err)
+		}
 	}
 	if _, err := st.pool.Exec(ctx,
-		`TRUNCATE missions, subtasks, agents, leases, artifacts, decisions, idempotency_keys, events`); err != nil {
+		`TRUNCATE missions, subtasks, agents, leases, artifacts, decisions, idempotency_keys, events, board_entries`); err != nil {
 		t.Fatalf("clean: %v", err)
 	}
 	t.Cleanup(st.Close)
@@ -115,5 +124,34 @@ func TestPGConformance(t *testing.T) {
 		if evs[i].Seq <= evs[i-1].Seq {
 			t.Fatal("seq not increasing")
 		}
+	}
+}
+
+// TestPGTriggerScopesRoundTrip M5-H2：trigger_scopes 列存取（0005 迁移）。
+func TestPGTriggerScopesRoundTrip(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+
+	// 未声明 → '[]'（默认收紧）
+	if err := st.UpsertAgent(ctx, &store.Agent{ID: "agt_plain", Name: "p", Platform: "http-echo"}, now); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	a, err := st.GetAgent(ctx, "agt_plain")
+	if err != nil || len(a.TriggerScopes) != 0 {
+		t.Fatalf("default scopes must be empty: %+v err=%v", a.TriggerScopes, err)
+	}
+	// 声明 + upsert 覆盖
+	if err := st.UpsertAgent(ctx, &store.Agent{ID: "agt_scoped", Name: "s", Platform: "http-echo",
+		TriggerScopes: []string{"trigger.create_mission"}}, now); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	if err := st.UpsertAgent(ctx, &store.Agent{ID: "agt_scoped", Name: "s", Platform: "http-echo",
+		TriggerScopes: []string{"trigger.wake"}}, now); err != nil {
+		t.Fatalf("re-UpsertAgent: %v", err)
+	}
+	a, err = st.GetAgent(ctx, "agt_scoped")
+	if err != nil || len(a.TriggerScopes) != 1 || a.TriggerScopes[0] != "trigger.wake" {
+		t.Fatalf("scopes round trip: %+v err=%v", a.TriggerScopes, err)
 	}
 }

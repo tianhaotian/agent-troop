@@ -54,6 +54,9 @@ type Agent struct {
 	Health         string            `json:"health"` // healthy | suspect | down
 	LastHeartbeat  time.Time         `json:"last_heartbeat"`
 	Running        int               `json:"running"` // 在途租约数（放置调度用）
+	// TriggerScopes 触发授权（M5-H2，§7.4：默认收紧、按授权放开）。
+	// 注册时显式声明，缺省 []——即默认不能经 /v1/intents create_mission/wake。
+	TriggerScopes  []string          `json:"trigger_scopes,omitempty"`
 }
 
 // Lease 执行租约（§4.3：fencing token 单调递增防僵尸写入）。
@@ -208,6 +211,9 @@ type Store interface {
 	// ---- 事件 ----
 	// ListMissionEvents 返回 Mission 及子任务相关事件（SSE 驱动，按 seq 递增）。
 	ListMissionEvents(ctx context.Context, missionID string, afterSeq int64, limit int) ([]*Event, error)
+	// AppendEvent 追加一条独立事件（M5：condition.cost_exceeded 等平台留痕；
+	// 不与状态迁移同事务时使用本方法）。
+	AppendEvent(ctx context.Context, e *Event) error
 
 	// ---- 决策（M2） ----
 	CreateDecision(ctx context.Context, d *Decision, now time.Time) error

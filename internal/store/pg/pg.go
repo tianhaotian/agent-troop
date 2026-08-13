@@ -117,6 +117,20 @@ func appendEvent(ctx context.Context, tx pgx.Tx, e *store.Event) error {
 		e.AggregateID, e.MissionID, e.Type, payload, actor, e.Ts).Scan(&e.Seq)
 }
 
+// AppendEvent 追加独立事件（M5：condition.cost_exceeded 等平台留痕；
+// 不与状态迁移同事务，单独短事务提交）。
+func (s *Store) AppendEvent(ctx context.Context, e *store.Event) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := appendEvent(ctx, tx, e); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ---- 任务面 ----
 
 func (s *Store) CreateMission(ctx context.Context, m *mission.Mission, subs []*mission.Subtask, actor store.Actor, now time.Time) error {
@@ -332,26 +346,32 @@ func (s *Store) UpsertAgent(ctx context.Context, a *store.Agent, now time.Time) 
 	if health == "" {
 		health = "healthy"
 	}
+	scopes, _ := js(a.TriggerScopes)
+	if a.TriggerScopes == nil {
+		scopes = []byte("[]") // 列 NOT NULL：未声明即默认收紧（空授权）
+	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO agents (id, name, platform, endpoint, capabilities, constraints, health, created_at, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+		`INSERT INTO agents (id, name, platform, endpoint, capabilities, constraints, health, trigger_scopes, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
 		 ON CONFLICT (id) DO UPDATE SET name=$2, platform=$3, endpoint=$4, capabilities=$5,
-		 constraints=$6, health=$7, updated_at=$8, version=agents.version+1`,
+		 constraints=$6, health=$7, trigger_scopes=$8, updated_at=$9, version=agents.version+1`,
 		a.ID, a.Name, a.Platform, endpoint, caps,
 		fmt.Sprintf(`{"max_concurrency":%d}`, a.MaxConcurrency),
-		fmt.Sprintf(`{"status":%q,"last_heartbeat":%q}`, health, now.Format(time.RFC3339Nano)), now)
+		fmt.Sprintf(`{"status":%q,"last_heartbeat":%q}`, health, now.Format(time.RFC3339Nano)),
+		scopes, now)
 	return err
 }
 
 func scanAgent(row pgx.Row) (*store.Agent, error) {
 	var a store.Agent
-	var caps, endpoint, constraints, health []byte
-	err := row.Scan(&a.ID, &a.Name, &a.Platform, &endpoint, &caps, &constraints, &health, &a.Running)
+	var caps, endpoint, constraints, health, scopes []byte
+	err := row.Scan(&a.ID, &a.Name, &a.Platform, &endpoint, &caps, &constraints, &health, &scopes, &a.Running)
 	if err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal(caps, &a.Capabilities)
 	_ = json.Unmarshal(endpoint, &a.Endpoint)
+	_ = json.Unmarshal(scopes, &a.TriggerScopes)
 	var c struct {
 		MaxConcurrency int `json:"max_concurrency"`
 	}
@@ -368,6 +388,7 @@ func scanAgent(row pgx.Row) (*store.Agent, error) {
 }
 
 const agentCols = `a.id, a.name, a.platform, a.endpoint, a.capabilities, a.constraints, a.health,
+	a.trigger_scopes,
 	(SELECT count(*) FROM leases l WHERE l.agent_id=a.id AND l.state='ACTIVE') AS running`
 
 func (s *Store) GetAgent(ctx context.Context, id string) (*store.Agent, error) {
@@ -1193,7 +1214,7 @@ func (s *Store) BoardGet(ctx context.Context, missionID, ns, key string) (*store
 func (s *Store) BoardList(ctx context.Context, missionID, ns string) ([]*store.BoardEntry, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT mission_id, namespace, key, value, version, updated_at FROM board_entries
-		 WHERE mission_id=$1 AND namespace=$2 ORDER BY key`, missionID, ns)
+		 WHERE mission_id=$1 AND ($2='' OR namespace=$2) ORDER BY namespace, key`, missionID, ns)
 	if err != nil {
 		return nil, err
 	}

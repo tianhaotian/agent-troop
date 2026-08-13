@@ -189,3 +189,36 @@ func TestFailSubtaskReleasesLease(t *testing.T) {
 		t.Fatalf("retry: %v", err)
 	}
 }
+
+// TestTriggerScopesRoundTrip M5-H2：trigger_scopes 存取与 upsert 覆盖（§7.4 默认收紧）。
+func TestTriggerScopesRoundTrip(t *testing.T) {
+	s, _, _ := setup(t)
+	// 未声明 → 缺省 nil（默认收紧：无触发权限）
+	registerAgent(t, s, "agt_plain", "x")
+	a, err := s.GetAgent(ctx, "agt_plain")
+	if err != nil || len(a.TriggerScopes) != 0 {
+		t.Fatalf("default scopes must be empty: %+v err=%v", a.TriggerScopes, err)
+	}
+	// 显式声明 → 读取一致
+	if err := s.UpsertAgent(ctx, &store.Agent{
+		ID: "agt_scoped", Name: "agt_scoped", Platform: "http-echo",
+		TriggerScopes: []string{"trigger.create_mission", "trigger.wake"},
+	}, now); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	a, err = s.GetAgent(ctx, "agt_scoped")
+	if err != nil || len(a.TriggerScopes) != 2 || a.TriggerScopes[0] != "trigger.create_mission" {
+		t.Fatalf("scopes round trip: %+v err=%v", a.TriggerScopes, err)
+	}
+	// upsert 覆盖（授权回收）
+	if err := s.UpsertAgent(ctx, &store.Agent{
+		ID: "agt_scoped", Name: "agt_scoped", Platform: "http-echo",
+		TriggerScopes: []string{"trigger.wake"},
+	}, now); err != nil {
+		t.Fatalf("re-UpsertAgent: %v", err)
+	}
+	a, _ = s.GetAgent(ctx, "agt_scoped")
+	if len(a.TriggerScopes) != 1 || a.TriggerScopes[0] != "trigger.wake" {
+		t.Fatalf("scopes update: %+v", a.TriggerScopes)
+	}
+}

@@ -3,7 +3,7 @@
 多智能体协同平台：跨 Agent 平台（OpenClaw / Hermes / 自研等）的任务拆解、中心化状态管理、调度与人在回路协作。
 
 - **设计文档**：[docs/design/multi-agent-collab-platform-design.md](docs/design/multi-agent-collab-platform-design.md)（22 节 + 附录，含架构、调度、触发体系、协作模式、质量/信誉/仿真/计量专题与技术选型 ADR）
-- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)、[M4 触发管道](docs/plan/M4-trigger-pipeline.md)）
+- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)、[M4 触发管道](docs/plan/M4-trigger-pipeline.md)、[M5 CEL 与授权](docs/plan/M5-cel-scope.md)）
 - **License**：[Apache 2.0](LICENSE)
 
 ## 开发流程约定（重要）
@@ -55,7 +55,8 @@ docker compose up -d postgres
 psql postgres://troop:troop@localhost:5432/troop -f migrations/0001_init.sql \
                                                -f migrations/0002_hitl_board.sql \
                                                -f migrations/0003_m3.sql \
-                                               -f migrations/0004_m4.sql
+                                               -f migrations/0004_m4.sql \
+                                               -f migrations/0005_m5.sql
 TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
 
 # 可选环境变量：TROOP_SCHEDULER=capability-first|round-robin（放置策略，M3）
@@ -124,6 +125,38 @@ curl -X POST localhost:8080/v1/intents -d '{
 }'
 ```
 
+## M5 API 示例（CEL 条件内核 / scope 触发授权）
+
+```bash
+# 1) condition 唤醒的 CEL 形态：condition.expr 与 M4 结构化谓词（board/op）互斥
+curl -X POST localhost:8080/v1/subtasks/sub_xxx/suspend -d '{
+  "agent_id":"echo1", "fencing_token":3, "version":4,
+  "wake_on":{
+    "kind":"condition",
+    "condition":{"expr":"board.shared.input_ready == true && board.shared.count >= 2"},
+    "deadline":"2026-08-20T09:00:00Z"
+  }
+}'
+# 数据模型：board.<ns>.<key>（ns/key 含点号时用下标 board["cfg.ns"]["k"]）、
+#   mission.{id,owner,goal,status}、subtask.{id,kind,state,attempt,assignee}、
+#   elapsed()（自挂起注册起）/ deadline_in()（距唤醒 TTL）——只读逻辑时钟，无裸系统时钟
+# 安全护栏（§14.3）：
+#   - 注册时编译 + 类型检查 + 静态 cost 估算，超限直接 400 拒绝；
+#   - 运行时 cost 上限，超限视为 false 并落 condition.cost_exceeded 事件告警；
+#   - 静态引用提取（board 键集随 wake_spec 持久化）：BoardPut 只增量评估引用
+#     该键的注册；动态下标等不可判定形态按通配处理（宁多评不漏评），sweeper 全量兜底
+
+# 2) scope 触发授权（§7.4 默认收紧）：Agent 注册时显式声明 trigger_scopes
+curl -X POST localhost:8080/v1/agents/register -d '{
+  "id":"agt_ext", "name":"ext", "platform":"custom",
+  "capabilities":[{"skill":"web.research","level":0.9}],
+  "trigger_scopes":["trigger.create_mission","trigger.wake"]
+}'
+# source.kind=agent 的 /v1/intents 强制校验：create_mission 需 trigger.create_mission、
+# wake 需 trigger.wake；未注册或未授权 → 403 且不消耗幂等键（鉴权先于去重）；
+# 缺省 trigger_scopes=[] 即默认不能触发；human source 不鉴权（SSO/RBAC 后续）
+```
+
 ## M2 API 示例（人在回路 / 黑板 / Artifact）
 
 ```bash
@@ -168,4 +201,5 @@ curl localhost:8080/v1/artifacts/art_xxx/content   # 响应头带 X-Artifact-SHA
 - **M2 ✅**：审批门/决策点 + Agent 决策请求 + 决策超时 + 黑板 + Artifact Store（[计划](docs/plan/M2-hitl.md)）
 - **M3 ✅**：调度策略插件化（capability-first/round-robin）+ Deadline/Priority 打分 + WAITING 挂起-唤醒（timer/manual + TTL）+ 检查点续跑（[计划](docs/plan/M3-sched-trigger.md)）
 - **M4 ✅**：event/condition 唤醒（水位线语义 + 增量评估 + sweeper 兜底）+ TaskIntent 准入管道（/v1/intents 幂等 create_mission / wake）（[计划](docs/plan/M4-trigger-pipeline.md)）
-- **M5（当前）**：CEL 条件内核（cel-go，cost 上限 + 静态引用提取）、scope 三级授权、A2A/MCP 适配、OpenClaw/Hermes 托管 Adapter、Agent 生态接入
+- **M5 ✅**：CEL 条件内核（cel-go：静态/运行时 cost 双闸 + 静态引用提取 + 逻辑时钟函数）+ scope 三级授权（trigger_scopes 默认收紧，鉴权先于去重）（[计划](docs/plan/M5-cel-scope.md)）
+- **M6（当前）**：A2A/MCP 适配、OpenClaw/Hermes 托管 Adapter、Agent 生态接入、主子委托（delegate/spawn_subtask）
