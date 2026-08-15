@@ -180,6 +180,15 @@ type Store interface {
 	BlockSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
 		actor Actor, now time.Time) (*mission.Subtask, error)
 
+	// ---- 主子委托（M6，§15.1） ----
+	// SpawnSubtask 原子完成（CompleteSubtask 同构）：幂等键撞键返回 ErrDuplicate +
+	// existingID（原子女 ID）；否则校验父任务 fencing token + RUNNING 态 + version，
+	// 插入子女（PENDING，parent_id 因果链）并追加创建事件。
+	SpawnSubtask(ctx context.Context, idemKey, parentID string, fencingToken, parentVersion int64,
+		child *mission.Subtask, actor Actor, now time.Time) (existingID string, err error)
+	// CountChildren 统计某子任务的直接子女数（delegate fanout 校验）。
+	CountChildren(ctx context.Context, parentID string) (int, error)
+
 	// ---- 挂起-唤醒（M3/M4，§7.3/§14.4） ----
 	// SuspendSubtask 校验 fencing token，RUNNING→WAITING 并**释放租约**
 	// （与 BLOCKED 不同：唤醒后重新调度，可换 Agent 凭 checkpoint 续跑）。

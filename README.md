@@ -3,7 +3,7 @@
 多智能体协同平台：跨 Agent 平台（OpenClaw / Hermes / 自研等）的任务拆解、中心化状态管理、调度与人在回路协作。
 
 - **设计文档**：[docs/design/multi-agent-collab-platform-design.md](docs/design/multi-agent-collab-platform-design.md)（22 节 + 附录，含架构、调度、触发体系、协作模式、质量/信誉/仿真/计量专题与技术选型 ADR）
-- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)、[M4 触发管道](docs/plan/M4-trigger-pipeline.md)、[M5 CEL 与授权](docs/plan/M5-cel-scope.md)）
+- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)、[M4 触发管道](docs/plan/M4-trigger-pipeline.md)、[M5 CEL 与授权](docs/plan/M5-cel-scope.md)、[M6 主子委托](docs/plan/M6-delegate.md)）
 - **License**：[Apache 2.0](LICENSE)
 
 ## 开发流程约定（重要）
@@ -157,6 +157,41 @@ curl -X POST localhost:8080/v1/agents/register -d '{
 # 缺省 trigger_scopes=[] 即默认不能触发；human source 不鉴权（SSO/RBAC 后续）
 ```
 
+## M6 API 示例（主子委托：delegate / rework）
+
+```bash
+# 1) Lead 在执行中（RUNNING、持租约）派生子女任务——fencing 即委托权
+#    需 trigger.spawn_subtask scope；幂等键必填（重发返回原子女 + deduplicated:true）
+curl -X POST localhost:8080/v1/intents -d '{
+  "source":{"kind":"agent", "id":"agt_lead"},
+  "action":"delegate", "idempotency_key":"dlg-42",
+  "parent_subtask_id":"sub_xxx", "fencing_token":3, "parent_version":4,
+  "task":{"name":"research", "required_skills":["web.research"],
+          "input":{"topic":"储能行业"}, "priority":5}
+}'
+# → {"mission_id":"msn_xxx", "subtask_id":"sub_xxx_research"}
+# 子女即建即 READY 参与调度（parent_id 因果链，不占 DAG 依赖位）；
+# max_depth / max_fanout 结构校验（Config.MaxDelegateDepth=4 / MaxDelegateFanout=8）
+
+# 2) Lead 挂起精确等待该子女完成（subtask.succeeded 载荷含 subtask_id），不空占资源
+curl -X POST localhost:8080/v1/subtasks/sub_xxx/suspend -d '{
+  "agent_id":"agt_lead", "fencing_token":3, "version":4,
+  "wake_on":{"kind":"event",
+    "event":{"types":["subtask.succeeded"], "where":{"subtask_id":"sub_xxx_research"}},
+    "deadline":"2026-08-20T09:00:00Z"}
+}'
+
+# 3) 验收不通过 → rework：链式重派新子女（rework_of 因果链 + feedback 入 input），
+#    链长达 Config.MaxRework=3 即拒，Lead 应换方案或升级人决策
+curl -X POST localhost:8080/v1/intents -d '{
+  "source":{"kind":"agent", "id":"agt_lead"},
+  "action":"delegate", "idempotency_key":"dlg-43",
+  "parent_subtask_id":"sub_xxx", "fencing_token":5, "parent_version":6,
+  "task":{"name":"research_v2", "required_skills":["web.research"],
+          "rework_of":"sub_xxx_research", "feedback":"数据太旧，补充 2026 年数据"}
+}'
+```
+
 ## M2 API 示例（人在回路 / 黑板 / Artifact）
 
 ```bash
@@ -202,4 +237,5 @@ curl localhost:8080/v1/artifacts/art_xxx/content   # 响应头带 X-Artifact-SHA
 - **M3 ✅**：调度策略插件化（capability-first/round-robin）+ Deadline/Priority 打分 + WAITING 挂起-唤醒（timer/manual + TTL）+ 检查点续跑（[计划](docs/plan/M3-sched-trigger.md)）
 - **M4 ✅**：event/condition 唤醒（水位线语义 + 增量评估 + sweeper 兜底）+ TaskIntent 准入管道（/v1/intents 幂等 create_mission / wake）（[计划](docs/plan/M4-trigger-pipeline.md)）
 - **M5 ✅**：CEL 条件内核（cel-go：静态/运行时 cost 双闸 + 静态引用提取 + 逻辑时钟函数）+ scope 三级授权（trigger_scopes 默认收紧，鉴权先于去重）（[计划](docs/plan/M5-cel-scope.md)）
-- **M6（当前）**：A2A/MCP 适配、OpenClaw/Hermes 托管 Adapter、Agent 生态接入、主子委托（delegate/spawn_subtask）
+- **M6 ✅**：主子委托协议核心（delegate 准入 + fencing 委托权 + 幂等派生 + depth/fanout 校验 + rework 链式重派 + 子女完成精确唤醒）（[计划](docs/plan/M6-delegate.md)）
+- **M7（当前）**：Lead 收件箱/计划快照/失联容错（§15.2-15.4）、预算池（§15.5）、上下文包（§16）、A2A/MCP 适配、托管 Adapter

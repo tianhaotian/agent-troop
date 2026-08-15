@@ -222,3 +222,77 @@ func TestTriggerScopesRoundTrip(t *testing.T) {
 		t.Fatalf("scopes update: %+v", a.TriggerScopes)
 	}
 }
+
+// TestSpawnSubtask M6-K1：delegate 原子落库（幂等 + fencing + RUNNING 校验）与子女计数。
+func TestSpawnSubtask(t *testing.T) {
+	s, _, _ := setup(t)
+	clk := clock.NewFake(now)
+	registerAgent(t, s, "agt_a", "x")
+	s.TransitionSubtask(ctx, "sub_a", mission.EvDepsSatisfied, 0, sys, nil, clk.Now(), nil)
+	l1, _ := s.OfferLease(ctx, "sub_a", "agt_a", 1, 30*time.Second, sys, clk.Now())
+	sub, _ := s.AcceptLease(ctx, l1.ID, l1.FencingToken, 2, agtA, clk.Now())
+	parent, _ := s.StartSubtask(ctx, "sub_a", l1.FencingToken, sub.Version, agtA, clk.Now())
+
+	child := &mission.Subtask{ID: "sub_c1", MissionID: "msn_1", ParentID: "sub_a",
+		Kind: mission.KindAgent, Input: map[string]any{"topic": "t"}}
+	// 错误 fencing → ErrFenced，不落库
+	if _, err := s.SpawnSubtask(ctx, "dlg-1", "sub_a", l1.FencingToken+9, parent.Version,
+		child, agtA, clk.Now()); !errors.Is(err, store.ErrFenced) {
+		t.Fatalf("bad fencing: %v", err)
+	}
+	// 错误 version → ErrConflict
+	if _, err := s.SpawnSubtask(ctx, "dlg-1", "sub_a", l1.FencingToken, parent.Version+1,
+		child, agtA, clk.Now()); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale version: %v", err)
+	}
+	// 正常派生：PENDING + parent_id + 事件留痕
+	if _, err := s.SpawnSubtask(ctx, "dlg-1", "sub_a", l1.FencingToken, parent.Version,
+		child, agtA, clk.Now()); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	subs, _ := s.ListSubtasks(ctx, "msn_1")
+	var got *mission.Subtask
+	for _, x := range subs {
+		if x.ID == "sub_c1" {
+			got = x
+		}
+	}
+	if got == nil || got.State != mission.StatePending || got.ParentID != "sub_a" || got.Input["topic"] != "t" {
+		t.Fatalf("child = %+v", got)
+	}
+	// 幂等重放：同键返回原子女 ID + ErrDuplicate
+	existing, err := s.SpawnSubtask(ctx, "dlg-1", "sub_a", l1.FencingToken, parent.Version,
+		&mission.Subtask{ID: "sub_other", MissionID: "msn_1"}, agtA, clk.Now())
+	if !errors.Is(err, store.ErrDuplicate) || existing != "sub_c1" {
+		t.Fatalf("dedup: existing=%s err=%v", existing, err)
+	}
+	// 子女计数
+	n, _ := s.CountChildren(ctx, "sub_a")
+	if n != 1 {
+		t.Fatalf("children = %d, want 1", n)
+	}
+	// 父任务非 RUNNING（完成后）→ 拒
+	cur, _ := s.ListSubtasks(ctx, "msn_1")
+	for _, x := range cur {
+		if x.ID == "sub_a" {
+			if _, err := s.CompleteSubtask(ctx, "sub_a", l1.FencingToken, "done-a", "r", x.Version, agtA, clk.Now()); err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+		}
+	}
+	if _, err := s.SpawnSubtask(ctx, "dlg-2", "sub_a", l1.FencingToken, 99,
+		&mission.Subtask{ID: "sub_c2", MissionID: "msn_1"}, agtA, clk.Now()); err == nil {
+		t.Fatal("spawn from terminal parent must be rejected")
+	}
+	// succeeded 事件载荷含 subtask_id（Lead 精确等待用）
+	evs, _ := s.ListMissionEvents(ctx, "msn_1", 0, 100)
+	found := false
+	for _, e := range evs {
+		if e.Type == string(mission.EvCompleted) && e.Payload["subtask_id"] == "sub_a" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("subtask.succeeded payload must carry subtask_id")
+	}
+}

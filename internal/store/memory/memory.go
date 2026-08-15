@@ -468,10 +468,63 @@ func (s *Store) CompleteSubtask(_ context.Context, id string, fencingToken int64
 	s.releaseLeaseLocked(l)
 	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvCompleted), map[string]any{
 		"state":      string(mission.StateSucceeded),
+		"subtask_id": sub.ID, // M6：Lead event 唤醒以 where 谓词精确等待特定子女
 		"result_ref": resultRef,
 	}, actor, now)
 	c := *sub
 	return &c, nil
+}
+
+// ---- 主子委托（M6，§15.1） ----
+
+// SpawnSubtask 原子完成：幂等去重 → 父任务 fencing + RUNNING 校验 → 子女插入（PENDING）。
+func (s *Store) SpawnSubtask(_ context.Context, idemKey, parentID string, fencingToken, parentVersion int64,
+	child *mission.Subtask, actor store.Actor, now time.Time) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 幂等优先：重复委托直接返回原子女（恰好一次，§4.3）
+	if existing, dup := s.idem[idemKey]; dup {
+		return existing, store.ErrDuplicate
+	}
+	parent, ok := s.subtasks[parentID]
+	if !ok {
+		return "", store.ErrNotFound
+	}
+	if parent.Version != parentVersion {
+		return "", store.ErrConflict
+	}
+	if _, err := s.checkFencingLocked(parent, fencingToken); err != nil {
+		return "", err
+	}
+	if parent.State != mission.StateRunning {
+		return "", store.ErrConflict // 只有 RUNNING 中的 Lead 能 delegate（§15.1 时序约束）
+	}
+	if _, exists := s.subtasks[child.ID]; exists {
+		return "", store.ErrConflict
+	}
+	c := *child
+	c.State = mission.StatePending
+	s.subtasks[child.ID] = &c
+	s.idem[idemKey] = child.ID
+	s.appendEventLocked(child.ID, child.MissionID, string(mission.EvCreated), map[string]any{
+		"kind":              string(child.Kind),
+		"parent_subtask_id": parentID,
+		"rework_of":         child.ReworkOf,
+	}, actor, now)
+	return "", nil
+}
+
+// CountChildren 直接子女计数（delegate fanout 校验）。
+func (s *Store) CountChildren(_ context.Context, parentID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, sub := range s.subtasks {
+		if sub.ParentID == parentID {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (s *Store) FailSubtask(_ context.Context, id string, fencingToken int64, reason string,

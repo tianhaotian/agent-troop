@@ -72,28 +72,34 @@ func scanSubtask(row pgx.Row) (*mission.Subtask, error) {
 		sub.ResultRef = *resultRef
 	}
 	var specObj struct {
-		RequiredSkills []string `json:"required_skills"`
-		Question       string   `json:"question"`
-		Options        []string `json:"options"`
-		OnTimeout      string   `json:"on_timeout"`
+		RequiredSkills []string       `json:"required_skills"`
+		Question       string         `json:"question"`
+		Options        []string       `json:"options"`
+		OnTimeout      string         `json:"on_timeout"`
+		Input          map[string]any `json:"input"`     // M6：delegate 子女任务载荷
+		ReworkOf       string         `json:"rework_of"` // M6：rework 链
 	}
 	_ = json.Unmarshal(spec, &specObj)
 	sub.RequiredSkills = specObj.RequiredSkills
 	sub.Question = specObj.Question
 	sub.Options = specObj.Options
 	sub.OnTimeout = specObj.OnTimeout
+	sub.Input = specObj.Input
+	sub.ReworkOf = specObj.ReworkOf
 	_ = json.Unmarshal(scheduling, &sub.Scheduling)
 	_ = json.Unmarshal(retry, &sub.Retry)
 	return &sub, nil
 }
 
-// marshalSpec 序列化 subtask spec JSONB（required_skills + human 节点字段）。
+// marshalSpec 序列化 subtask spec JSONB（required_skills + human 节点字段 + M6 委托字段）。
 func marshalSpec(sub *mission.Subtask) []byte {
 	spec, _ := json.Marshal(map[string]any{
 		"required_skills": sub.RequiredSkills,
 		"question":        sub.Question,
 		"options":         sub.Options,
 		"on_timeout":      sub.OnTimeout,
+		"input":           sub.Input,
+		"rework_of":       sub.ReworkOf,
 	})
 	return spec
 }
@@ -727,13 +733,86 @@ func (s *Store) CompleteSubtask(ctx context.Context, id string, fencingToken int
 		return nil, err
 	}
 	ev := &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID, Type: string(mission.EvCompleted),
-		Payload: map[string]any{"state": string(mission.StateSucceeded), "result_ref": resultRef},
-		Actor:   actor, Ts: now}
+		Payload: map[string]any{"state": string(mission.StateSucceeded),
+			"subtask_id": sub.ID, // M6：Lead event 唤醒以 where 谓词精确等待特定子女
+			"result_ref": resultRef},
+		Actor: actor, Ts: now}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return nil, err
 	}
 	sub.Version++
 	return sub, tx.Commit(ctx)
+}
+
+// ---- 主子委托（M6，§15.1） ----
+
+// SpawnSubtask 原子完成：幂等去重 → 父任务 fencing + RUNNING 校验 → 子女插入（PENDING）。
+func (s *Store) SpawnSubtask(ctx context.Context, idemKey, parentID string, fencingToken, parentVersion int64,
+	child *mission.Subtask, actor store.Actor, now time.Time) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	// 幂等优先：重复委托直接返回原子女（恰好一次，§4.3）
+	var existing string
+	if err := tx.QueryRow(ctx, `SELECT result FROM idempotency_keys WHERE key=$1`, idemKey).
+		Scan(&existing); err == nil {
+		return existing, store.ErrDuplicate
+	}
+	parent, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, parentID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", store.ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if parent.Version != parentVersion {
+		return "", store.ErrConflict
+	}
+	if err := loadActiveLease(ctx, tx, parent, fencingToken); err != nil {
+		return "", err
+	}
+	if parent.State != mission.StateRunning {
+		return "", store.ErrConflict // 只有 RUNNING 中的 Lead 能 delegate（§15.1 时序约束）
+	}
+	child.State = mission.StatePending
+	spec := marshalSpec(child)
+	scheduling, _ := js(child.Scheduling)
+	retry, _ := js(child.Retry)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO subtasks (id, mission_id, parent_id, kind, spec, scheduling, retry, state,
+		 depends_on, attempt, version, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'{}',0,0,$9,$9)`,
+		child.ID, child.MissionID, parentID, string(child.Kind), spec, scheduling, retry,
+		string(child.State), now); err != nil {
+		return "", store.ErrConflict // 子女 ID 冲突
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO idempotency_keys (key, result, created_at) VALUES ($1,$2,$3)`,
+		idemKey, child.ID, now); err != nil {
+		return "", err
+	}
+	ev := &store.Event{AggregateID: child.ID, MissionID: child.MissionID, Type: string(mission.EvCreated),
+		Payload: map[string]any{
+			"kind":              string(child.Kind),
+			"parent_subtask_id": parentID,
+			"rework_of":         child.ReworkOf,
+		}, Actor: actor, Ts: now}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return "", err
+	}
+	return "", tx.Commit(ctx)
+}
+
+// CountChildren 直接子女计数（delegate fanout 校验）。
+func (s *Store) CountChildren(ctx context.Context, parentID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM subtasks WHERE parent_id=$1`, parentID).Scan(&n)
+	return n, err
 }
 
 func (s *Store) FailSubtask(ctx context.Context, id string, fencingToken int64, reason string,

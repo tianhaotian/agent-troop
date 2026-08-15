@@ -155,3 +155,86 @@ func TestPGTriggerScopesRoundTrip(t *testing.T) {
 		t.Fatalf("scopes round trip: %+v err=%v", a.TriggerScopes, err)
 	}
 }
+
+// TestPGSpawnSubtask M6-K1：pg 侧 delegate 原子落库一致性（幂等/fencing/RUNNING 校验）。
+func TestPGSpawnSubtask(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	sys := store.Actor{Kind: "system", ID: "test"}
+	agt := store.Actor{Kind: "agent", ID: "agt_a"}
+
+	m := &mission.Mission{ID: "msn_pg2", Owner: "u1", Goal: "g", Status: mission.MissionActive}
+	if err := st.CreateMission(ctx, m, []*mission.Subtask{
+		{ID: "sub_pgp", MissionID: m.ID, Kind: mission.KindAgent, State: mission.StatePending},
+	}, sys, now); err != nil {
+		t.Fatalf("CreateMission: %v", err)
+	}
+	if err := st.UpsertAgent(ctx, &store.Agent{ID: "agt_a", Name: "a", Platform: "http-echo"}, now); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	if _, err := st.TransitionSubtask(ctx, "sub_pgp", mission.EvDepsSatisfied, 0, sys, nil, now, nil); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	l1, err := st.OfferLease(ctx, "sub_pgp", "agt_a", 1, 30*time.Second, sys, now)
+	if err != nil {
+		t.Fatalf("OfferLease: %v", err)
+	}
+	sub, err := st.AcceptLease(ctx, l1.ID, l1.FencingToken, 1, agt, now)
+	if err != nil {
+		t.Fatalf("AcceptLease: %v", err)
+	}
+	parent, err := st.StartSubtask(ctx, "sub_pgp", l1.FencingToken, sub.Version, agt, now)
+	if err != nil {
+		t.Fatalf("StartSubtask: %v", err)
+	}
+	child := &mission.Subtask{ID: "sub_pgc1", MissionID: m.ID, ParentID: parent.ID,
+		Kind: mission.KindAgent, Input: map[string]any{"topic": "t"}, ReworkOf: ""}
+	if _, err := st.SpawnSubtask(ctx, "pg-dlg-1", parent.ID, l1.FencingToken+9, parent.Version,
+		child, agt, now); !errors.Is(err, store.ErrFenced) {
+		t.Fatalf("bad fencing: %v", err)
+	}
+	if _, err := st.SpawnSubtask(ctx, "pg-dlg-1", parent.ID, l1.FencingToken, parent.Version,
+		child, agt, now); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	existing, err := st.SpawnSubtask(ctx, "pg-dlg-1", parent.ID, l1.FencingToken, parent.Version,
+		&mission.Subtask{ID: "sub_pgcX", MissionID: m.ID}, agt, now)
+	if !errors.Is(err, store.ErrDuplicate) || existing != "sub_pgc1" {
+		t.Fatalf("dedup: existing=%s err=%v", existing, err)
+	}
+	n, _ := st.CountChildren(ctx, parent.ID)
+	if n != 1 {
+		t.Fatalf("children = %d, want 1", n)
+	}
+	// spec jsonb 内的 input/rework_of 回读一致
+	subs, _ := st.ListSubtasks(ctx, m.ID)
+	var got *mission.Subtask
+	for _, x := range subs {
+		if x.ID == "sub_pgc1" {
+			got = x
+		}
+	}
+	if got == nil || got.Input["topic"] != "t" || got.ParentID != parent.ID {
+		t.Fatalf("child spec round trip: %+v", got)
+	}
+	// succeeded 载荷含 subtask_id
+	cur, _ := st.ListSubtasks(ctx, m.ID)
+	for _, x := range cur {
+		if x.ID == parent.ID {
+			if _, err := st.CompleteSubtask(ctx, parent.ID, l1.FencingToken, "pg-done", "r", x.Version, agt, now); err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+		}
+	}
+	evs, _ := st.ListMissionEvents(ctx, m.ID, 0, 100)
+	found := false
+	for _, e := range evs {
+		if e.Type == string(mission.EvCompleted) && e.Payload["subtask_id"] == parent.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("subtask.succeeded payload must carry subtask_id")
+	}
+}

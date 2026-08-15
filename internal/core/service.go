@@ -21,10 +21,15 @@ type Config struct {
 	OfferTTL       time.Duration // OFFERED 租约寿命（Agent 须在此时间内 accept）
 	ScheduleBatch  int           // 单轮调度拉取的就绪任务数
 	HeartbeatStale time.Duration // 超过该时长无心跳标记 suspect
+	// 主子委托（M6，§15.1 结构校验）
+	MaxDelegateDepth  int // 委托链最大深度（沿 parent_id 上溯）
+	MaxDelegateFanout int // 单父任务最大直接子女数
+	MaxRework         int // rework 链上限（到达后 Lead 应换方案/升级人决策）
 }
 
 func DefaultConfig() Config {
-	return Config{OfferTTL: 30 * time.Second, ScheduleBatch: 100, HeartbeatStale: 90 * time.Second}
+	return Config{OfferTTL: 30 * time.Second, ScheduleBatch: 100, HeartbeatStale: 90 * time.Second,
+		MaxDelegateDepth: 4, MaxDelegateFanout: 8, MaxRework: 3}
 }
 
 type Service struct {

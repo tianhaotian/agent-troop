@@ -88,6 +88,10 @@ type Subtask struct {
 	Question   string          `json:"question,omitempty"`
 	Options    []string        `json:"options,omitempty"`
 	OnTimeout  string          `json:"on_timeout,omitempty"` // auto_approve | auto_reject | ""
+	// 主子委托（M6，§15.1）：delegate 子女的任务载荷与 rework 链。
+	// ParentID（0001 已有）表达委托关系——子女不参与 DAG 依赖传播，即建即 READY。
+	Input      map[string]any  `json:"input,omitempty"`    // 任务载荷（rework 时含 feedback）
+	ReworkOf   string          `json:"rework_of,omitempty"` // 本任务是对该子任务的验收不通过重派
 	// Continuation（M3/M4，§7.3）：挂起-唤醒与检查点续跑
 	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"`    // 透明载荷（≤64KB），续跑 Agent 自行解释
 	WakeKind     string          `json:"wake_kind,omitempty"`     // timer | manual | event | condition

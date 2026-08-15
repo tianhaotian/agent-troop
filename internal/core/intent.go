@@ -31,12 +31,17 @@ var ErrForbidden = errors.New("core: forbidden")
 // Intent 统一触发意图（API 触发 / Agent 主动触发归一化后的形态）。
 type Intent struct {
 	Source         store.Actor `json:"source"`           // 触发者（kind: human|agent）
-	Action         string      `json:"action"`           // create_mission | wake
-	IdempotencyKey string      `json:"idempotency_key"`  // create_mission 必填
+	Action         string      `json:"action"`           // create_mission | wake | delegate
+	IdempotencyKey string      `json:"idempotency_key"`  // create_mission / delegate 必填
 	Owner          string      `json:"owner,omitempty"`  // create_mission
 	Goal           string      `json:"goal,omitempty"`   // create_mission
 	Tasks          []TaskSpec  `json:"tasks,omitempty"`  // create_mission
 	SubtaskID      string      `json:"subtask_id,omitempty"` // wake
+	// delegate（M6）：Lead 持父任务租约派生子女
+	ParentSubtaskID string        `json:"parent_subtask_id,omitempty"`
+	FencingToken    int64         `json:"fencing_token,omitempty"`
+	ParentVersion   int64         `json:"parent_version,omitempty"`
+	Task            *DelegateSpec `json:"task,omitempty"`
 }
 
 // IntentResult 准入结果。
@@ -57,6 +62,8 @@ func (s *Service) SubmitIntent(ctx context.Context, in Intent) (*IntentResult, e
 		need = ScopeCreateMission
 	case IntentWake:
 		need = ScopeWake
+	case IntentDelegate:
+		need = ScopeSpawnSubtask // §7.4(1)：Mission 内委派
 	default:
 		return nil, fmt.Errorf("core: unsupported intent action %q", in.Action)
 	}
@@ -78,6 +85,8 @@ func (s *Service) SubmitIntent(ctx context.Context, in Intent) (*IntentResult, e
 			return nil, err
 		}
 		return &IntentResult{SubtaskID: in.SubtaskID}, nil
+	case IntentDelegate:
+		return s.intentDelegate(ctx, in)
 	}
 	return nil, fmt.Errorf("core: unsupported intent action %q", in.Action)
 }
