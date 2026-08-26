@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -35,7 +36,7 @@ func main() {
 	}
 	must(post("/v1/agents/register", map[string]any{
 		"id": *id, "name": *id, "platform": "http-echo",
-		"capabilities": caps, "max_concurrency": 2,
+		"capabilities": caps, "max_concurrency": 2, "auth_subject": envOr("TROOP_AUTH_SUBJECT", *id),
 	}, nil))
 	log.Printf("registered as %s with skills %s", *id, *skills)
 
@@ -101,7 +102,12 @@ func runTask(subtaskID string, version int64, leaseID string, token int64) {
 }
 
 func get(path string, out any) error {
-	resp, err := http.Get(*server + path)
+	req, err := http.NewRequest(http.MethodGet, *server+path, nil)
+	if err != nil {
+		return err
+	}
+	authorize(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -111,7 +117,13 @@ func get(path string, out any) error {
 
 func post(path string, body, out any) error {
 	buf, _ := json.Marshal(body)
-	resp, err := http.Post(*server+path, "application/json", bytes.NewReader(buf))
+	req, err := http.NewRequest(http.MethodPost, *server+path, bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	authorize(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -124,6 +136,19 @@ func post(path string, body, out any) error {
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
+}
+
+func authorize(req *http.Request) {
+	if token := os.Getenv("TROOP_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func must(err error) {

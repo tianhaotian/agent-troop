@@ -61,6 +61,18 @@ func mustRegisterScopes(t *testing.T, s *Service, id string, scopes []string, ma
 	}
 }
 
+func TestRegisterAgentRejectsDuplicateAuthSubject(t *testing.T) {
+	s, _, _ := newService()
+	if err := s.RegisterAgent(ctx, &store.Agent{ID: "agt_auth_a", Name: "a", Platform: "custom",
+		AuthSubject: "runtime/shared"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RegisterAgent(ctx, &store.Agent{ID: "agt_auth_b", Name: "b", Platform: "custom",
+		AuthSubject: "runtime/shared"}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("duplicate auth subject=%v", err)
+	}
+}
+
 // runOneTask 模拟 Agent 完成一个 OFFERED 任务（accept→start→complete）。
 func runOneTask(t *testing.T, s *Service, agentID string, subs []*mission.Subtask) {
 	t.Helper()

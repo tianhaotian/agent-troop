@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-troop"
+version = "0.8.0"
+description = "Agent Troop protocol SDK"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_troop*"]

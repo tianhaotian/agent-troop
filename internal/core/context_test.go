@@ -123,11 +123,23 @@ func TestContextPackageAndPermissionAttenuation(t *testing.T) {
 		firstPkg.BoardViews[0].Mode != mission.BoardModeReadOnly || firstPkg.Budget.Available != 80 {
 		t.Fatalf("child context leaked or incomplete: %+v", firstPkg)
 	}
+	if err := s.AuthorizeArtifactAccess(ctx, allowedID, firstLeaseID, "agt_ctx_worker"); err != nil {
+		t.Fatalf("authorized artifact access: %v", err)
+	}
+	if err := s.AuthorizeArtifactAccess(ctx, cross.ID, firstLeaseID, "agt_ctx_worker"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("cross-mission artifact access=%v", err)
+	}
+	if err := s.AuthorizeArtifactAccess(ctx, allowedID, firstLeaseID, "agt_ctx_lead"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("cross-agent artifact access=%v", err)
+	}
 
 	// offer 到期后重派会产生新的不可变 package；可见内容未变，因此 hash 稳定。
 	clk.Advance(2 * s.cfg.OfferTTL)
 	if _, err := s.st.ExpireLeases(ctx, clk.Now()); err != nil {
 		t.Fatal(err)
+	}
+	if err := s.AuthorizeArtifactAccess(ctx, allowedID, firstLeaseID, "agt_ctx_worker"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expired lease artifact access=%v", err)
 	}
 	if _, err := s.ScheduleOnce(ctx); err != nil {
 		t.Fatal(err)

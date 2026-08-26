@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"agenttroop/internal/api"
+	"agenttroop/internal/auth"
 	"agenttroop/internal/clock"
 	"agenttroop/internal/core"
 	"agenttroop/internal/store"
@@ -46,7 +47,18 @@ func main() {
 		WithBlob(core.FSBlob{Dir: envOr("TROOP_BLOB_DIR", "./data/artifacts")}).
 		WithStrategy(strategy)
 	log.Printf("scheduler: %s", strategy.Name())
-	handler := api.New(svc).Handler()
+	server := api.New(svc)
+	if secret := os.Getenv("TROOP_AUTH_SECRET"); secret != "" {
+		manager, err := auth.New(secret, clk)
+		if err != nil {
+			log.Fatalf("auth: %v", err)
+		}
+		server = api.NewAuthenticated(svc, manager)
+		log.Printf("auth: bearer authentication enabled")
+	} else {
+		log.Printf("auth: disabled (set TROOP_AUTH_SECRET in production)")
+	}
+	handler := server.Handler()
 
 	// 后台循环：调度器 + human 节点工单 + 清扫器（轮询间隔为运行机制，非业务时间语义）
 	stop := make(chan struct{})

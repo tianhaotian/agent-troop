@@ -150,7 +150,12 @@ func (s *Service) CreateMission(ctx context.Context, owner, goal string, tasks [
 // CreateMissionWithBudget 创建可选 token 硬顶账户；budgetTokens=0 保持历史 unmetered 语义。
 func (s *Service) CreateMissionWithBudget(ctx context.Context, owner, goal string, budgetTokens int64,
 	tasks []TaskSpec) (*mission.Mission, error) {
-	return s.createMission(ctx, newID("msn"), store.Actor{Kind: "human", ID: owner},
+	return s.CreateMissionWithBudgetAs(ctx, store.Actor{Kind: "human", ID: owner}, owner, goal, budgetTokens, tasks)
+}
+
+func (s *Service) CreateMissionWithBudgetAs(ctx context.Context, actor store.Actor, owner, goal string,
+	budgetTokens int64, tasks []TaskSpec) (*mission.Mission, error) {
+	return s.createMission(ctx, newID("msn"), actor,
 		owner, goal, budgetTokens, tasks)
 }
 
@@ -245,8 +250,11 @@ func (s *Service) ListAgents(ctx context.Context) ([]*store.Agent, error) {
 
 // CancelMission 级联取消全部非终态子任务（§3.2）。
 func (s *Service) CancelMission(ctx context.Context, id, owner string) error {
+	return s.CancelMissionAs(ctx, id, store.Actor{Kind: "human", ID: owner})
+}
+
+func (s *Service) CancelMissionAs(ctx context.Context, id string, actor store.Actor) error {
 	now := s.clk.Now()
-	actor := store.Actor{Kind: "human", ID: owner}
 	subs, err := s.st.ListSubtasks(ctx, id)
 	if err != nil {
 		return err
@@ -369,6 +377,17 @@ func (s *Service) RegisterAgent(ctx context.Context, a *store.Agent) error {
 	if a.ID == "" {
 		a.ID = newID("agt")
 	}
+	if a.AuthSubject != "" {
+		agents, err := s.st.ListAgents(ctx)
+		if err != nil {
+			return err
+		}
+		for _, existing := range agents {
+			if existing.ID != a.ID && existing.AuthSubject == a.AuthSubject {
+				return fmt.Errorf("%w: auth_subject already registered", store.ErrConflict)
+			}
+		}
+	}
 	if a.Health == "" {
 		a.Health = "healthy"
 	}
@@ -381,6 +400,32 @@ func (s *Service) Heartbeat(ctx context.Context, agentID string) error {
 
 func (s *Service) GetAgent(ctx context.Context, id string) (*store.Agent, error) {
 	return s.st.GetAgent(ctx, id)
+}
+
+func (s *Service) GetSubtask(ctx context.Context, id string) (*mission.Subtask, error) {
+	return s.st.GetSubtask(ctx, id)
+}
+
+// AuthorizeArtifactAccess proves that an active Agent lease received this Artifact in its
+// immutable context package. It is used before issuing a short-lived download URL.
+func (s *Service) AuthorizeArtifactAccess(ctx context.Context, artifactID, leaseID, agentID string) error {
+	lease, err := s.st.GetLease(ctx, leaseID)
+	if err != nil {
+		return err
+	}
+	if lease.AgentID != agentID || lease.State != store.LeaseActive {
+		return fmt.Errorf("%w: active lease is not owned by agent", ErrForbidden)
+	}
+	pkg, err := s.st.GetContextPackage(ctx, leaseID)
+	if err != nil {
+		return err
+	}
+	for _, artifact := range pkg.Artifacts {
+		if artifact.ID == artifactID {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: artifact is outside lease context", ErrForbidden)
 }
 
 // GetLease 查询租约（API 层向 Adapter 下发 offer 时附带 fencing token）。

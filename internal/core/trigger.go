@@ -115,14 +115,17 @@ func (s *Service) Suspend(ctx context.Context, subtaskID string, fencingToken, v
 
 // Wake 人工唤醒 WAITING 子任务（M3 无鉴权；scope 授权在 M5 准入管道引入）。
 func (s *Service) Wake(ctx context.Context, subtaskID, actorID string) (*mission.Subtask, error) {
+	return s.WakeAs(ctx, subtaskID, store.Actor{Kind: "human", ID: actorID})
+}
+
+func (s *Service) WakeAs(ctx context.Context, subtaskID string, actor store.Actor) (*mission.Subtask, error) {
 	sub, err := s.st.ListSubtasksByState(ctx, mission.StateWaiting)
 	if err != nil {
 		return nil, err
 	}
 	for _, x := range sub {
 		if x.ID == subtaskID {
-			return s.st.WakeSubtask(ctx, subtaskID, x.Version,
-				store.Actor{Kind: "human", ID: actorID}, s.clk.Now())
+			return s.st.WakeSubtask(ctx, subtaskID, x.Version, actor, s.clk.Now())
 		}
 	}
 	return nil, store.ErrNotFound

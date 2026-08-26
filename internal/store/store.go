@@ -25,7 +25,7 @@ var (
 
 // Actor 事件行为者（审计三元组之一，§10）。
 type Actor struct {
-	Kind string `json:"kind"` // human | agent | system
+	Kind string `json:"kind"` // human | agent | service | system
 	ID   string `json:"id"`
 }
 
@@ -60,6 +60,8 @@ type Agent struct {
 	// TriggerScopes 触发授权（M5-H2，§7.4：默认收紧、按授权放开）。
 	// 注册时显式声明，缺省 []——即默认不能经 /v1/intents create_mission/wake。
 	TriggerScopes []string `json:"trigger_scopes,omitempty"`
+	// AuthSubject 是外部身份令牌的稳定 subject。为空时兼容地回退为 Agent ID。
+	AuthSubject string `json:"auth_subject,omitempty"`
 }
 
 // Lease 执行租约（§4.3：fencing token 单调递增防僵尸写入）。

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"agenttroop/internal/mission"
@@ -429,27 +430,36 @@ func (s *Store) UpsertAgent(ctx context.Context, a *store.Agent, now time.Time) 
 		scopes = []byte("[]") // 列 NOT NULL：未声明即默认收紧（空授权）
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO agents (id, name, platform, endpoint, capabilities, constraints, health, trigger_scopes, created_at, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
+		`INSERT INTO agents (id, name, platform, endpoint, capabilities, constraints, health, trigger_scopes, auth_subject, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,''),$10,$10)
 		 ON CONFLICT (id) DO UPDATE SET name=$2, platform=$3, endpoint=$4, capabilities=$5,
-		 constraints=$6, health=$7, trigger_scopes=$8, updated_at=$9, version=agents.version+1`,
+		 constraints=$6, health=$7, trigger_scopes=$8, auth_subject=NULLIF($9,''), updated_at=$10, version=agents.version+1`,
 		a.ID, a.Name, a.Platform, endpoint, caps,
 		fmt.Sprintf(`{"max_concurrency":%d}`, a.MaxConcurrency),
 		fmt.Sprintf(`{"status":%q,"last_heartbeat":%q}`, health, now.Format(time.RFC3339Nano)),
-		scopes, now)
+		scopes, a.AuthSubject, now)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return store.ErrConflict
+	}
 	return err
 }
 
 func scanAgent(row pgx.Row) (*store.Agent, error) {
 	var a store.Agent
 	var caps, endpoint, constraints, health, scopes []byte
-	err := row.Scan(&a.ID, &a.Name, &a.Platform, &endpoint, &caps, &constraints, &health, &scopes, &a.Running)
+	var authSubject *string
+	err := row.Scan(&a.ID, &a.Name, &a.Platform, &endpoint, &caps, &constraints, &health, &scopes,
+		&authSubject, &a.Running)
 	if err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal(caps, &a.Capabilities)
 	_ = json.Unmarshal(endpoint, &a.Endpoint)
 	_ = json.Unmarshal(scopes, &a.TriggerScopes)
+	if authSubject != nil {
+		a.AuthSubject = *authSubject
+	}
 	var c struct {
 		MaxConcurrency int `json:"max_concurrency"`
 	}
@@ -466,7 +476,7 @@ func scanAgent(row pgx.Row) (*store.Agent, error) {
 }
 
 const agentCols = `a.id, a.name, a.platform, a.endpoint, a.capabilities, a.constraints, a.health,
-	a.trigger_scopes,
+	a.trigger_scopes, a.auth_subject,
 	(SELECT count(*) FROM leases l WHERE l.agent_id=a.id AND l.state='ACTIVE') AS running`
 
 func (s *Store) GetAgent(ctx context.Context, id string) (*store.Agent, error) {

@@ -1,4 +1,5 @@
-# Console（M1 切片 S11，待实现）
+# Console
 
 最小只读控制台：Mission DAG 状态图 + 事件时间线（SSE 驱动）。
-技术栈：React + React Flow（设计 §22.3）。M1 先用服务端直出静态页验证 SSE 链路。
+当前已由 `internal/api/console.go` 提供最小只读 Console（DAG 状态 + SSE 时间线）。
+完整 React + React Flow 运维控制台留待后续产品化阶段。

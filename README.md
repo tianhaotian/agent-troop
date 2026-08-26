@@ -3,7 +3,7 @@
 多智能体协同平台：跨 Agent 平台（OpenClaw / Hermes / 自研等）的任务拆解、中心化状态管理、调度与人在回路协作。
 
 - **设计文档**：[docs/design/multi-agent-collab-platform-design.md](docs/design/multi-agent-collab-platform-design.md)（22 节 + 附录，含架构、调度、触发体系、协作模式、质量/信誉/仿真/计量专题与技术选型 ADR）
-- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)、[M4 触发管道](docs/plan/M4-trigger-pipeline.md)、[M5 CEL 与授权](docs/plan/M5-cel-scope.md)、[M6 主子委托](docs/plan/M6-delegate.md)、[M7A 生产可靠性基线](docs/plan/M7A-production-baseline.md)、[M7B Lead 恢复闭环](docs/plan/M7B-lead-recovery.md)、[M7C 预算预占与结算](docs/plan/M7C-budget-holds.md)、[M7D 权限与上下文包](docs/plan/M7D-context-permissions.md)）
+- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付 M1–M7 及 [M8 安全外部接入与协议生态](docs/plan/M8-ecosystem-security.md)）
 - **License**：[Apache 2.0](LICENSE)
 
 ## 开发流程约定（重要）
@@ -20,15 +20,14 @@
 ```
 cmd/troopd/          控制平面单二进制（API + Orchestrator + Scheduler + Trigger）
 internal/
-  mission/           任务模型与状态机（Mission / Subtask / 事件）
-  store/             PostgreSQL 访问层（实体 + SKIP LOCKED 队列 + 事件日志）
-  orchestrator/      DAG 执行引擎
-  scheduler/         放置调度（Filter → Score → Lease + Fencing）
-  registry/          Agent 注册、能力画像、健康
-  trigger/           触发准入管道、定时/事件/条件唤醒（M3）
-  api/               REST/OpenAPI 北向接口 + SSE
+  api/               REST/SSE + A2A/MCP 协议边界
+  auth/              Bearer 身份令牌与签名资源 URL
+  core/              编排、调度、触发、委托、预算与上下文业务层
+  mission/           任务模型、权限包络与状态机
+  store/             memory / PostgreSQL 存储实现
 migrations/          SQL 迁移（PG-first，见设计 §22.4）
 adapters/http-echo/  通用 HTTP Adapter 参考实现（回显 Agent，用于端到端自测）
+adapters/managed-http/ OpenClaw/Hermes/自研 runtime 托管 HTTP Adapter
 sdk/python/          Agent SDK（Python，薄协议封装）
 web/console/         Web 控制台（DAG 视图 + 事件时间线）
 docs/design/         系统设计文档
@@ -60,7 +59,8 @@ psql postgres://troop:troop@localhost:5432/troop -f migrations/0001_init.sql \
                                                -f migrations/0006_reliability.sql \
                                                -f migrations/0007_lead_recovery.sql \
                                                -f migrations/0008_budget.sql \
-                                               -f migrations/0009_context_packages.sql
+                                               -f migrations/0009_context_packages.sql \
+                                               -f migrations/0010_external_identity.sql
 TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
 
 # 探针：healthz 只检查进程；readyz 会真实检查 Store（PG 不可用时返回 503）
@@ -69,6 +69,45 @@ curl -f localhost:8080/readyz
 
 # 可选环境变量：TROOP_SCHEDULER=capability-first|round-robin（放置策略，M3）
 #               TROOP_BLOB_DIR=./data/artifacts（Artifact blob 目录）
+#               TROOP_AUTH_SECRET=<至少32字节>（生产必须；为空仅本地兼容模式）
+```
+
+## M8 API 示例（身份 / 签名资源 / A2A / MCP）
+
+```bash
+# 启用认证。bootstrap secret 只用于运维换取短时平台 token，不写日志/数据库。
+export TROOP_AUTH_SECRET='replace-with-at-least-32-random-bytes'
+go run ./cmd/troopd
+
+# 签发 human/service/agent token（最长 24h；生产由 OIDC/API Gateway 调用此交换入口）
+curl -X POST localhost:8080/v1/auth/tokens \
+  -H "X-Troop-Bootstrap-Token: $TROOP_AUTH_SECRET" \
+  -d '{"subject":"ops@example","kind":"human","ttl_seconds":3600}'
+
+# Agent 由 human/service 预注册，auth_subject 与其 token subject 绑定；请求体 agent_id
+# 不再是身份凭据，跨 Agent 冒用会返回 403。
+curl -X POST localhost:8080/v1/agents/register -H "Authorization: Bearer $HUMAN_TOKEN" -d '{
+  "id":"agt_openclaw","name":"openclaw","platform":"openclaw",
+  "auth_subject":"runtime/openclaw-1","capabilities":[{"skill":"web.research","level":0.9}]
+}'
+
+# 为 Artifact 生成最长 15 分钟的签名 URL。Agent 还必须提供属于自己的 active lease，
+# 且该 Artifact 已出现在 lease 的不可变 context_package 中。
+curl -X POST localhost:8080/v1/artifacts/art_xxx/signed-url \
+  -H "Authorization: Bearer $AGENT_TOKEN" \
+  -d '{"agent_id":"agt_openclaw","lease_id":"les_xxx","expires_in":300}'
+
+# A2A Agent Card / JSON-RPC
+curl localhost:8080/.well-known/agent-card.json
+curl -X POST localhost:8080/a2a -H "Authorization: Bearer $HUMAN_TOKEN" -d '{
+  "jsonrpc":"2.0","id":1,"method":"SendMessage",
+  "params":{"message":{"role":"ROLE_USER","parts":[{"text":"调研储能行业"}]}}
+}'
+
+# MCP Streamable HTTP：initialize、tools/list、tools/call、resources/read 等 JSON-RPC
+curl -X POST localhost:8080/mcp -H "Authorization: Bearer $HUMAN_TOKEN" -d '{
+  "jsonrpc":"2.0","id":1,"method":"tools/list","params":{}
+}'
 ```
 
 ## M3 API 示例（挂起-唤醒 / 检查点续跑）
@@ -331,4 +370,5 @@ curl localhost:8080/v1/artifacts/art_xxx/content   # 响应头带 X-Artifact-SHA
 - **M7B ✅**：Lead 收件箱/计划快照/失联 takeover（[计划](docs/plan/M7B-lead-recovery.md)）
 - **M7C ✅**：Mission 预算池、delegate 原子 hold 与完成/失败/取消结算（[计划](docs/plan/M7C-budget-holds.md)）
 - **M7D ✅ / M7 完成**：权限包络衰减、lease 级不可变上下文包、最小知情视图与 SHA-256 审计（[计划](docs/plan/M7D-context-permissions.md)）
-- **M8（下一阶段）**：A2A/MCP 协议适配、外部身份认证、签名资源 URL 与托管 Adapter
+- **M8 ✅**：Bearer 外部身份与 Agent subject 绑定、签名 Artifact URL、A2A/MCP 协议边界、托管 HTTP Adapter 与 Python SDK（[计划](docs/plan/M8-ecosystem-security.md)）
+- **M9（下一阶段）**：Verifier 质量管线、信誉反馈闭环、权威计量与可观测性

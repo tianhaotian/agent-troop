@@ -269,11 +269,12 @@ func TestPGTriggerScopesRoundTrip(t *testing.T) {
 	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 
 	// 未声明 → '[]'（默认收紧）
-	if err := st.UpsertAgent(ctx, &store.Agent{ID: "agt_plain", Name: "p", Platform: "http-echo"}, now); err != nil {
+	if err := st.UpsertAgent(ctx, &store.Agent{ID: "agt_plain", Name: "p", Platform: "http-echo",
+		AuthSubject: "runtime/plain"}, now); err != nil {
 		t.Fatalf("UpsertAgent: %v", err)
 	}
 	a, err := st.GetAgent(ctx, "agt_plain")
-	if err != nil || len(a.TriggerScopes) != 0 {
+	if err != nil || len(a.TriggerScopes) != 0 || a.AuthSubject != "runtime/plain" {
 		t.Fatalf("default scopes must be empty: %+v err=%v", a.TriggerScopes, err)
 	}
 	// 声明 + upsert 覆盖

@@ -11,21 +11,33 @@ import (
 	"strconv"
 	"time"
 
+	"agenttroop/internal/auth"
 	"agenttroop/internal/core"
 	"agenttroop/internal/mission"
 	"agenttroop/internal/store"
 )
 
 type Server struct {
-	svc *core.Service
+	svc  *core.Service
+	auth *auth.Manager
 }
 
 func New(svc *core.Service) *Server { return &Server{svc: svc} }
+
+func NewAuthenticated(svc *core.Service, manager *auth.Manager) *Server {
+	return &Server{svc: svc, auth: manager}
+}
 
 func (s *Server) Handler() http.Handler {
 	mux := newRouter()
 	mux.handle("GET /healthz", s.healthz)
 	mux.handle("GET /readyz", s.readyz)
+	mux.handle("GET /.well-known/agent-card.json", s.agentCard)
+	mux.handle("POST /a2a", s.a2aJSONRPC)
+	mux.handle("POST /mcp", s.mcpJSONRPC)
+	if s.auth != nil {
+		mux.handle("POST /v1/auth/tokens", s.issueToken)
+	}
 
 	// 任务面
 	mux.handle("POST /v1/missions", s.createMission)
@@ -68,13 +80,14 @@ func (s *Server) Handler() http.Handler {
 	mux.handle("POST /v1/artifacts", s.putArtifact)
 	mux.handle("GET /v1/artifacts/{id}", s.getArtifact)
 	mux.handle("GET /v1/artifacts/{id}/content", s.getArtifactContent)
+	mux.handle("POST /v1/artifacts/{id}/signed-url", s.signArtifactURL)
 
 	// 触发准入（M4-G3）
 	mux.handle("POST /v1/intents", s.submitIntent)
 
 	// 最小 Console（S11）
 	mux.handle("GET /", s.console)
-	return mux
+	return s.authenticate(mux)
 }
 
 // ---- helpers ----
@@ -114,6 +127,18 @@ func writeErr(w http.ResponseWriter, err error) {
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json: " + err.Error()})
+		return false
+	}
+	return true
+}
+
+func decodeLimited(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
+	body, ok := readBodyLimited(w, r, limit)
+	if !ok {
+		return false
+	}
+	if err := json.Unmarshal(body, v); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json: " + err.Error()})
 		return false
 	}
@@ -165,7 +190,8 @@ func (s *Server) createMission(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner/goal/tasks required"})
 		return
 	}
-	m, err := s.svc.CreateMissionWithBudget(r.Context(), req.Owner, req.Goal, req.BudgetTokens, req.Tasks)
+	actor := requestActor(r, store.Actor{Kind: "human", ID: req.Owner})
+	m, err := s.svc.CreateMissionWithBudgetAs(r.Context(), actor, req.Owner, req.Goal, req.BudgetTokens, req.Tasks)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -206,7 +232,8 @@ func (s *Server) cancelMission(w http.ResponseWriter, r *http.Request) {
 	if body.Owner == "" {
 		body.Owner = "anonymous"
 	}
-	if err := s.svc.CancelMission(r.Context(), id, body.Owner); err != nil {
+	actor := requestActor(r, store.Actor{Kind: "human", ID: body.Owner})
+	if err := s.svc.CancelMissionAs(r.Context(), id, actor); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -262,6 +289,7 @@ type registerAgentReq struct {
 	MaxConcurrency int                `json:"max_concurrency,omitempty"`
 	// TriggerScopes M5-H2：触发授权（§7.4；缺省 [] 默认收紧）
 	TriggerScopes []string `json:"trigger_scopes,omitempty"`
+	AuthSubject   string   `json:"auth_subject,omitempty"`
 }
 
 func (s *Server) registerAgent(w http.ResponseWriter, r *http.Request) {
@@ -276,7 +304,7 @@ func (s *Server) registerAgent(w http.ResponseWriter, r *http.Request) {
 	a := &store.Agent{
 		ID: req.ID, Name: req.Name, Platform: req.Platform, Endpoint: req.Endpoint,
 		Capabilities: req.Capabilities, MaxConcurrency: req.MaxConcurrency,
-		TriggerScopes: req.TriggerScopes,
+		TriggerScopes: req.TriggerScopes, AuthSubject: req.AuthSubject,
 	}
 	if err := s.svc.RegisterAgent(r.Context(), a); err != nil {
 		writeErr(w, err)
@@ -286,6 +314,9 @@ func (s *Server) registerAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAgentIdentity(w, r, pv(r, "id")) {
+		return
+	}
 	if err := s.svc.Heartbeat(r.Context(), pv(r, "id")); err != nil {
 		writeErr(w, err)
 		return
@@ -301,6 +332,9 @@ type offerView struct {
 }
 
 func (s *Server) listOffers(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAgentIdentity(w, r, pv(r, "id")) {
+		return
+	}
 	offers, err := s.svc.ListOffers(r.Context(), pv(r, "id"))
 	if err != nil {
 		writeErr(w, err)
@@ -323,6 +357,16 @@ func (s *Server) listOffers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getLeaseContext(w http.ResponseWriter, r *http.Request) {
+	if s.auth != nil {
+		lease, err := s.svc.GetLease(r.Context(), pv(r, "id"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		if !s.requireAgentOrPrivileged(w, r, lease.AgentID) {
+			return
+		}
+	}
 	pkg, err := s.svc.GetContextPackage(r.Context(), pv(r, "id"))
 	if err != nil {
 		writeErr(w, err)
@@ -344,6 +388,9 @@ func (s *Server) acceptLease(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
+		return
+	}
 	sub, err := s.svc.AcceptLease(r.Context(), pv(r, "id"), req.FencingToken, req.SubtaskVersion, req.AgentID)
 	if err != nil {
 		writeErr(w, err)
@@ -361,6 +408,9 @@ type fencedReq struct {
 func (s *Server) startSubtask(w http.ResponseWriter, r *http.Request) {
 	var req fencedReq
 	if !decode(w, r, &req) {
+		return
+	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
 		return
 	}
 	sub, err := s.svc.StartSubtask(r.Context(), pv(r, "id"), req.FencingToken, req.Version, req.AgentID)
@@ -383,6 +433,9 @@ func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
+		return
+	}
 	if err := s.svc.Progress(r.Context(), pv(r, "id"), req.LeaseID, req.FencingToken, req.AgentID, req.Checkpoint); err != nil {
 		writeErr(w, err)
 		return
@@ -391,6 +444,9 @@ func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listLeadInbox(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSubtaskOrPrivileged(w, r, pv(r, "id")) {
+		return
+	}
 	status := r.URL.Query().Get("status")
 	if status == "" {
 		status = store.LeadInboxPending
@@ -419,6 +475,9 @@ func (s *Server) ingestLeadInbox(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
+		return
+	}
 	item, err := s.svc.IngestLeadInbox(r.Context(), pv(r, "id"), pv(r, "item"), req.AgentID,
 		req.FencingToken, req.ExpectedVersion, req.Mode)
 	if err != nil {
@@ -440,6 +499,9 @@ func (s *Server) leadHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
+		return
+	}
 	if req.ExpectedVersion == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected_version required"})
 		return
@@ -454,6 +516,9 @@ func (s *Server) leadHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) leadContext(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSubtaskOrPrivileged(w, r, pv(r, "id")) {
+		return
+	}
 	ctx, err := s.svc.GetLeadContext(r.Context(), pv(r, "id"))
 	if err != nil {
 		writeErr(w, err)
@@ -476,6 +541,9 @@ func (s *Server) suspend(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
+		return
+	}
 	sub, err := s.svc.Suspend(r.Context(), pv(r, "id"), req.FencingToken, req.Version,
 		req.AgentID, &req.WakeOn, req.Checkpoint)
 	if err != nil {
@@ -496,7 +564,8 @@ func (s *Server) wake(w http.ResponseWriter, r *http.Request) {
 	if req.ActorID == "" {
 		req.ActorID = "anonymous"
 	}
-	sub, err := s.svc.Wake(r.Context(), pv(r, "id"), req.ActorID)
+	actor := requestActor(r, store.Actor{Kind: "human", ID: req.ActorID})
+	sub, err := s.svc.WakeAs(r.Context(), pv(r, "id"), actor)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -516,6 +585,9 @@ type completeReq struct {
 func (s *Server) completeSubtask(w http.ResponseWriter, r *http.Request) {
 	var req completeReq
 	if !decode(w, r, &req) {
+		return
+	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
 		return
 	}
 	sub, err := s.svc.CompleteSubtaskWithUsage(r.Context(), pv(r, "id"),
@@ -542,6 +614,9 @@ type failReq struct {
 func (s *Server) failSubtask(w http.ResponseWriter, r *http.Request) {
 	var req failReq
 	if !decode(w, r, &req) {
+		return
+	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
 		return
 	}
 	sub, err := s.svc.FailSubtask(r.Context(), pv(r, "id"), req.FencingToken, req.Reason, req.Version, req.AgentID)
@@ -576,6 +651,9 @@ func (s *Server) resolveDecision(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if identity, ok := auth.FromContext(r.Context()); ok {
+		req.DeciderID = identity.Subject
+	}
 	if req.Choice == "" || req.DeciderID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "choice/decider_id required"})
 		return
@@ -601,6 +679,9 @@ func (s *Server) requestDecision(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if !s.requireAgentIdentity(w, r, req.AgentID) {
+		return
+	}
 	if req.Question == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "question required"})
 		return
@@ -620,6 +701,16 @@ func (s *Server) submitIntent(w http.ResponseWriter, r *http.Request) {
 	var in core.Intent
 	if !decode(w, r, &in) {
 		return
+	}
+	if s.auth != nil {
+		identity, _ := auth.FromContext(r.Context())
+		if identity.Kind == "agent" && in.Source.Kind != "agent" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "agent token cannot claim a non-agent source"})
+			return
+		}
+		if in.Source.Kind == "agent" && !s.requireAgentIdentity(w, r, in.Source.ID) {
+			return
+		}
 	}
 	res, err := s.svc.SubmitIntent(r.Context(), in)
 	if err != nil {
@@ -679,6 +770,12 @@ func (s *Server) putArtifact(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Mission-ID required"})
 		return
 	}
+	if s.auth != nil {
+		identity, _ := auth.FromContext(r.Context())
+		if identity.Kind == "agent" && !s.requireSubtaskIdentity(w, r, r.Header.Get("X-Produced-By")) {
+			return
+		}
+	}
 	body, ok := readBodyLimited(w, r, 64<<20)
 	if !ok {
 		return
@@ -702,6 +799,9 @@ func (s *Server) getArtifact(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getArtifactContent(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeArtifactDownload(w, r, pv(r, "id")) {
+		return
+	}
 	data, a, err := s.svc.GetArtifactContent(r.Context(), pv(r, "id"))
 	if err != nil {
 		writeErr(w, err)
