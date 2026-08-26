@@ -19,32 +19,44 @@ import (
 type Store struct {
 	mu sync.Mutex
 
-	missions  map[string]*mission.Mission
-	subtasks  map[string]*mission.Subtask // by id
-	agents    map[string]*store.Agent
-	leases    map[string]*store.Lease // by id
-	events    []*store.Event
-	idem      map[string]string // key → result
-	decisions map[string]*store.Decision
-	board     map[string]*store.BoardEntry // missionID/ns/key
-	artifacts map[string]*store.Artifact
+	missions    map[string]*mission.Mission
+	subtasks    map[string]*mission.Subtask // by id
+	agents      map[string]*store.Agent
+	leases      map[string]*store.Lease // by id
+	events      []*store.Event
+	idem        map[string]string // key → result
+	decisions   map[string]*store.Decision
+	board       map[string]*store.BoardEntry // missionID/ns/key
+	artifacts   map[string]*store.Artifact
+	leadInbox   map[string]*store.LeadInboxItem
+	budgets     map[string]*store.BudgetAccount  // by mission id; missing means unmetered
+	budgetHolds map[string]*store.BudgetHold     // by subtask id
+	contexts    map[string]*store.ContextPackage // by lease id
 
-	eventSeq     int64
-	fencingSeq   int64
-	leaseSeq     int64
+	eventSeq   int64
+	fencingSeq int64
+	leaseSeq   int64
 }
 
 func New() *Store {
 	return &Store{
-		missions: map[string]*mission.Mission{},
-		subtasks: map[string]*mission.Subtask{},
-		agents:   map[string]*store.Agent{},
-		leases:   map[string]*store.Lease{},
-		idem:      map[string]string{},
-		decisions: map[string]*store.Decision{},
-		board:     map[string]*store.BoardEntry{},
-		artifacts: map[string]*store.Artifact{},
+		missions:    map[string]*mission.Mission{},
+		subtasks:    map[string]*mission.Subtask{},
+		agents:      map[string]*store.Agent{},
+		leases:      map[string]*store.Lease{},
+		idem:        map[string]string{},
+		decisions:   map[string]*store.Decision{},
+		board:       map[string]*store.BoardEntry{},
+		artifacts:   map[string]*store.Artifact{},
+		leadInbox:   map[string]*store.LeadInboxItem{},
+		budgets:     map[string]*store.BudgetAccount{},
+		budgetHolds: map[string]*store.BudgetHold{},
+		contexts:    map[string]*store.ContextPackage{},
 	}
+}
+
+func (s *Store) Ping(ctx context.Context) error {
+	return ctx.Err()
 }
 
 // ---- 任务面 ----
@@ -57,7 +69,15 @@ func (s *Store) CreateMission(_ context.Context, m *mission.Mission, subs []*mis
 	}
 	cp := *m
 	s.missions[m.ID] = &cp
-	s.appendEventLocked(m.ID, m.ID, "mission.created", map[string]any{"goal": m.Goal, "owner": m.Owner}, actor, now)
+	if m.BudgetTokens > 0 {
+		s.budgets[m.ID] = &store.BudgetAccount{
+			MissionID: m.ID, Metered: true, Total: m.BudgetTokens,
+			Available: m.BudgetTokens, UpdatedAt: now,
+		}
+	}
+	s.appendEventLocked(m.ID, m.ID, "mission.created", map[string]any{
+		"goal": m.Goal, "owner": m.Owner, "budget_tokens": m.BudgetTokens,
+	}, actor, now)
 	for _, sub := range subs {
 		c := *sub
 		s.subtasks[sub.ID] = &c
@@ -74,6 +94,54 @@ func (s *Store) GetMission(_ context.Context, id string) (*mission.Mission, erro
 		return nil, store.ErrNotFound
 	}
 	cp := *m
+	return &cp, nil
+}
+
+func (s *Store) GetMissionBudget(_ context.Context, missionID string) (*store.BudgetAccount, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.missions[missionID]; !ok {
+		return nil, store.ErrNotFound
+	}
+	account, ok := s.budgets[missionID]
+	if !ok {
+		return &store.BudgetAccount{MissionID: missionID}, nil
+	}
+	cp := *account
+	cp.Available = cp.Total - cp.Held - cp.Spent
+	return &cp, nil
+}
+
+func (s *Store) ListBudgetHolds(_ context.Context, missionID string) ([]*store.BudgetHold, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.missions[missionID]; !ok {
+		return nil, store.ErrNotFound
+	}
+	var out []*store.BudgetHold
+	for _, hold := range s.budgetHolds {
+		if hold.MissionID == missionID {
+			cp := *hold
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *Store) GetSubtask(_ context.Context, id string) (*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subtasks[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	cp := *sub
 	return &cp, nil
 }
 
@@ -290,7 +358,12 @@ func (s *Store) OfferLease(_ context.Context, subtaskID, agentID string, expecte
 		ExpiresAt:    now.Add(ttl),
 		State:        store.LeaseActive,
 	}
+	pkg, err := s.buildContextPackageLocked(lease.ID, sub, now)
+	if err != nil {
+		return nil, err
+	}
 	s.leases[lease.ID] = lease
+	s.contexts[lease.ID] = pkg
 	sub.State = mission.StateOffered
 	sub.Assignee = agentID
 	sub.LeaseID = lease.ID
@@ -304,8 +377,60 @@ func (s *Store) OfferLease(_ context.Context, subtaskID, agentID string, expecte
 		"lease_id":      lease.ID,
 		"fencing_token": lease.FencingToken,
 	}, actor, now)
+	s.appendEventLocked(subtaskID, sub.MissionID, "context.materialized", map[string]any{
+		"context_package_id": pkg.ID, "lease_id": lease.ID, "snapshot_hash": pkg.SnapshotHash,
+	}, store.Actor{Kind: "system", ID: "context-builder"}, now)
 	c := *lease
 	return &c, nil
+}
+
+func (s *Store) buildContextPackageLocked(leaseID string, sub *mission.Subtask, now time.Time) (*store.ContextPackage, error) {
+	var artifacts []*store.Artifact
+	for _, id := range sub.Grants.ArtifactRefs {
+		if artifact := s.artifacts[id]; artifact != nil {
+			artifacts = append(artifacts, artifact)
+		}
+	}
+	views := map[string]*store.ContextBoardEntry{}
+	for _, grant := range sub.Grants.BoardViews {
+		allowed := map[string]struct{}{}
+		for _, key := range grant.Keys {
+			allowed[key] = struct{}{}
+		}
+		for _, entry := range s.board {
+			if entry.MissionID != sub.MissionID || entry.Namespace != grant.Namespace {
+				continue
+			}
+			if len(allowed) > 0 {
+				if _, ok := allowed[entry.Key]; !ok {
+					continue
+				}
+			}
+			key := entry.Namespace + "\x00" + entry.Key
+			current := views[key]
+			if current == nil || current.Mode == mission.BoardModeReadOnly && grant.Mode == mission.BoardModeReadWrite {
+				views[key] = &store.ContextBoardEntry{Namespace: entry.Namespace, Key: entry.Key,
+					Value: append([]byte(nil), entry.Value...), Version: entry.Version, Mode: grant.Mode}
+			}
+		}
+	}
+	board := make([]*store.ContextBoardEntry, 0, len(views))
+	for _, view := range views {
+		board = append(board, view)
+	}
+	var decisions []*store.Decision
+	for _, decision := range s.decisions {
+		if decision.MissionID == sub.MissionID && decision.SubtaskID == sub.ID {
+			decisions = append(decisions, decision)
+		}
+	}
+	var budget *store.BudgetAccount
+	if current := s.budgets[sub.MissionID]; current != nil {
+		cp := *current
+		cp.Available = cp.Total - cp.Held - cp.Spent
+		budget = &cp
+	}
+	return store.BuildContextPackage(leaseID, sub, artifacts, board, decisions, budget, now)
 }
 
 func (s *Store) AcceptLease(_ context.Context, leaseID string, fencingToken int64, expectedSubVersion int64,
@@ -350,6 +475,24 @@ func (s *Store) GetLease(_ context.Context, id string) (*store.Lease, error) {
 	return &c, nil
 }
 
+func (s *Store) GetContextPackage(_ context.Context, leaseID string) (*store.ContextPackage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pkg := s.contexts[leaseID]
+	if pkg == nil {
+		return nil, store.ErrNotFound
+	}
+	raw, err := json.Marshal(pkg)
+	if err != nil {
+		return nil, err
+	}
+	var cp store.ContextPackage
+	if err := json.Unmarshal(raw, &cp); err != nil {
+		return nil, err
+	}
+	return &cp, nil
+}
+
 func (s *Store) RenewLease(_ context.Context, leaseID string, fencingToken int64, ttl time.Duration, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -372,21 +515,23 @@ func (s *Store) ExpireLeases(_ context.Context, now time.Time) (int, error) {
 		if l.State != store.LeaseActive || l.ExpiresAt.After(now) {
 			continue
 		}
-		l.State = store.LeaseExpired
 		sub := s.subtasks[l.SubtaskID]
+		// RUNNING 租约由 Lead takeover/后续执行策略处理；不能先置 EXPIRED 导致永久卡死。
+		if sub == nil || (sub.State != mission.StateOffered && sub.State != mission.StateLeased) {
+			continue
+		}
+		l.State = store.LeaseExpired
 		if a, ok := s.agents[l.AgentID]; ok && a.Running > 0 {
 			a.Running--
 		}
-		if sub != nil && (sub.State == mission.StateOffered || sub.State == mission.StateLeased) {
-			sub.State = mission.StateReady
-			sub.Assignee, sub.LeaseID = "", ""
-			sub.Version++
-			s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvLeaseExpired), map[string]any{
-				"state":    string(mission.StateReady),
-				"lease_id": l.ID,
-			}, store.Actor{Kind: "system", ID: "lease-sweeper"}, now)
-			n++
-		}
+		sub.State = mission.StateReady
+		sub.Assignee, sub.LeaseID = "", ""
+		sub.Version++
+		s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvLeaseExpired), map[string]any{
+			"state":    string(mission.StateReady),
+			"lease_id": l.ID,
+		}, store.Actor{Kind: "system", ID: "lease-sweeper"}, now)
+		n++
 	}
 	return n, nil
 }
@@ -440,6 +585,16 @@ func (s *Store) StartSubtask(_ context.Context, id string, fencingToken int64, e
 
 func (s *Store) CompleteSubtask(_ context.Context, id string, fencingToken int64, idemKey, resultRef string,
 	expectedVersion int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	return s.completeSubtask(id, fencingToken, idemKey, resultRef, 0, expectedVersion, actor, now)
+}
+
+func (s *Store) CompleteSubtaskWithUsage(_ context.Context, id string, fencingToken int64, idemKey, resultRef string,
+	usageTokens, expectedVersion int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	return s.completeSubtask(id, fencingToken, idemKey, resultRef, usageTokens, expectedVersion, actor, now)
+}
+
+func (s *Store) completeSubtask(id string, fencingToken int64, idemKey, resultRef string,
+	usageTokens, expectedVersion int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sub, ok := s.subtasks[id]
@@ -461,6 +616,9 @@ func (s *Store) CompleteSubtask(_ context.Context, id string, fencingToken int64
 	if _, err := mission.Apply(sub.State, mission.EvCompleted); err != nil {
 		return nil, store.ErrConflict
 	}
+	if err := s.settleBudgetHoldLocked(sub, usageTokens, actor, now); err != nil {
+		return nil, err
+	}
 	sub.State = mission.StateSucceeded
 	sub.ResultRef = resultRef
 	sub.Version++
@@ -471,13 +629,78 @@ func (s *Store) CompleteSubtask(_ context.Context, id string, fencingToken int64
 		"subtask_id": sub.ID, // M6：Lead event 唤醒以 where 谓词精确等待特定子女
 		"result_ref": resultRef,
 	}, actor, now)
+	if sub.ParentID != "" {
+		itemID := store.LeadInboxID(sub.ID)
+		if _, exists := s.leadInbox[itemID]; !exists {
+			s.leadInbox[itemID] = &store.LeadInboxItem{
+				ID: itemID, MissionID: sub.MissionID, LeadSubtaskID: sub.ParentID,
+				SourceSubtaskID: sub.ID, Kind: "result", ResultRef: resultRef,
+				Status: store.LeadInboxPending, CreatedAt: now,
+			}
+			s.appendEventLocked(sub.ParentID, sub.MissionID, "lead.inbox.enqueued", map[string]any{
+				"item_id": itemID, "source_subtask_id": sub.ID, "result_ref": resultRef,
+			}, store.Actor{Kind: "system", ID: "lead-inbox"}, now)
+		}
+	}
 	c := *sub
 	return &c, nil
 }
 
+func (s *Store) settleBudgetHoldLocked(sub *mission.Subtask, usageTokens int64, actor store.Actor, now time.Time) error {
+	hold := s.budgetHolds[sub.ID]
+	if hold == nil || hold.Status != store.BudgetHoldHeld {
+		return nil
+	}
+	if usageTokens < 0 {
+		return store.ErrBudgetExceeded
+	}
+	account := s.budgets[sub.MissionID]
+	if account == nil {
+		return store.ErrConflict
+	}
+	otherHeld := account.Held - hold.Amount
+	if otherHeld < 0 || usageTokens > account.Total-account.Spent-otherHeld {
+		return store.ErrBudgetExceeded
+	}
+	account.Held = otherHeld
+	account.Spent += usageTokens
+	account.Version++
+	account.UpdatedAt = now
+	account.Available = account.Total - account.Held - account.Spent
+	hold.Actual = usageTokens
+	hold.Status = store.BudgetHoldSettled
+	hold.SettledAt = &now
+	s.appendEventLocked(sub.ID, sub.MissionID, "budget.settled", map[string]any{
+		"hold_id": hold.ID, "reserved_tokens": hold.Amount, "actual_tokens": usageTokens,
+		"available_tokens": account.Available,
+	}, actor, now)
+	return nil
+}
+
+func (s *Store) releaseBudgetHoldLocked(sub *mission.Subtask, reason string, actor store.Actor, now time.Time) {
+	hold := s.budgetHolds[sub.ID]
+	if hold == nil || hold.Status != store.BudgetHoldHeld {
+		return
+	}
+	account := s.budgets[sub.MissionID]
+	if account == nil {
+		return
+	}
+	account.Held -= hold.Amount
+	account.Version++
+	account.UpdatedAt = now
+	account.Available = account.Total - account.Held - account.Spent
+	hold.Status = store.BudgetHoldReleased
+	hold.SettledAt = &now
+	s.appendEventLocked(sub.ID, sub.MissionID, "budget.released", map[string]any{
+		"hold_id": hold.ID, "amount_tokens": hold.Amount, "reason": reason,
+		"available_tokens": account.Available,
+	}, actor, now)
+}
+
 // ---- 主子委托（M6，§15.1） ----
 
-// SpawnSubtask 原子完成：幂等去重 → 父任务 fencing + RUNNING 校验 → 子女插入（PENDING）。
+// SpawnSubtask 原子完成：幂等去重 → 父任务 fencing + RUNNING 校验 → 子女插入并激活 READY。
 func (s *Store) SpawnSubtask(_ context.Context, idemKey, parentID string, fencingToken, parentVersion int64,
 	child *mission.Subtask, actor store.Actor, now time.Time) (string, error) {
 	s.mu.Lock()
@@ -493,24 +716,60 @@ func (s *Store) SpawnSubtask(_ context.Context, idemKey, parentID string, fencin
 	if parent.Version != parentVersion {
 		return "", store.ErrConflict
 	}
-	if _, err := s.checkFencingLocked(parent, fencingToken); err != nil {
+	lease, err := s.checkFencingLocked(parent, fencingToken)
+	if err != nil {
 		return "", err
+	}
+	if lease.AgentID != actor.ID || !lease.ExpiresAt.After(now) {
+		return "", store.ErrFenced
 	}
 	if parent.State != mission.StateRunning {
 		return "", store.ErrConflict // 只有 RUNNING 中的 Lead 能 delegate（§15.1 时序约束）
 	}
+	if !mission.PermissionEnvelopeSubset(parent.Grants, child.Grants) {
+		return "", store.ErrPermissionExceeded
+	}
 	if _, exists := s.subtasks[child.ID]; exists {
 		return "", store.ErrConflict
 	}
+	account := s.budgets[child.MissionID]
+	if account != nil {
+		amount := child.Scheduling.BudgetTokens
+		if amount <= 0 {
+			return "", store.ErrBudgetRequired
+		}
+		if account.Total-account.Held-account.Spent < amount {
+			return "", store.ErrBudgetExceeded
+		}
+	}
 	c := *child
-	c.State = mission.StatePending
+	c.State = mission.StateReady
+	c.Version = 1
 	s.subtasks[child.ID] = &c
 	s.idem[idemKey] = child.ID
+	if account != nil {
+		amount := child.Scheduling.BudgetTokens
+		hold := &store.BudgetHold{
+			ID: store.BudgetHoldID(child.ID), MissionID: child.MissionID, SubtaskID: child.ID,
+			Attempt: child.Attempt, Amount: amount, Status: store.BudgetHoldHeld, CreatedAt: now,
+		}
+		s.budgetHolds[child.ID] = hold
+		account.Held += amount
+		account.Version++
+		account.UpdatedAt = now
+		account.Available = account.Total - account.Held - account.Spent
+		s.appendEventLocked(child.ID, child.MissionID, "budget.held", map[string]any{
+			"hold_id": hold.ID, "amount_tokens": amount, "available_tokens": account.Available,
+		}, actor, now)
+	}
 	s.appendEventLocked(child.ID, child.MissionID, string(mission.EvCreated), map[string]any{
 		"kind":              string(child.Kind),
 		"parent_subtask_id": parentID,
 		"rework_of":         child.ReworkOf,
 	}, actor, now)
+	s.appendEventLocked(child.ID, child.MissionID, string(mission.EvDepsSatisfied),
+		map[string]any{"state": string(mission.StateReady)},
+		store.Actor{Kind: "system", ID: "orchestrator"}, now)
 	return "", nil
 }
 
@@ -525,6 +784,158 @@ func (s *Store) CountChildren(_ context.Context, parentID string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+func (s *Store) ListLeadInbox(_ context.Context, leadSubtaskID string, pendingOnly bool) ([]*store.LeadInboxItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*store.LeadInboxItem
+	for _, item := range s.leadInbox {
+		if item.LeadSubtaskID != leadSubtaskID || pendingOnly && item.Status != store.LeadInboxPending {
+			continue
+		}
+		c := *item
+		out = append(out, &c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *Store) IngestLeadInbox(_ context.Context, itemID, leadSubtaskID string,
+	fencingToken, expectedVersion int64, mode string, actor store.Actor, now time.Time) (*store.LeadInboxItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.leadInbox[itemID]
+	if !ok || item.LeadSubtaskID != leadSubtaskID {
+		return nil, store.ErrNotFound
+	}
+	lead := s.subtasks[leadSubtaskID]
+	if lead == nil {
+		return nil, store.ErrNotFound
+	}
+	if lead.State != mission.StateRunning {
+		return nil, store.ErrConflict
+	}
+	lease, err := s.checkFencingLocked(lead, fencingToken)
+	if err != nil {
+		return nil, err
+	}
+	if lease.AgentID != actor.ID || !lease.ExpiresAt.After(now) {
+		return nil, store.ErrFenced
+	}
+	if item.Status != store.LeadInboxPending || item.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	item.Status, item.IngestMode, item.IngestedBy = store.LeadInboxIngested, mode, actor.ID
+	item.IngestedAt = &now
+	item.Version++
+	s.appendEventLocked(lead.ID, lead.MissionID, "lead.inbox.ingested", map[string]any{
+		"item_id": item.ID, "source_subtask_id": item.SourceSubtaskID, "mode": mode,
+	}, actor, now)
+	c := *item
+	return &c, nil
+}
+
+func (s *Store) SaveLeadSnapshot(_ context.Context, leadSubtaskID string, fencingToken, expectedVersion int64,
+	value []byte, leaseTTL time.Duration, actor store.Actor, now time.Time) (*store.BoardEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lead := s.subtasks[leadSubtaskID]
+	if lead == nil {
+		return nil, store.ErrNotFound
+	}
+	if lead.State != mission.StateRunning {
+		return nil, store.ErrConflict
+	}
+	lease, err := s.checkFencingLocked(lead, fencingToken)
+	if err != nil {
+		return nil, err
+	}
+	if lease.AgentID != actor.ID || !lease.ExpiresAt.After(now) {
+		return nil, store.ErrFenced
+	}
+	k := boardKey(lead.MissionID, "lead-plan", lead.ID)
+	cur, exists := s.board[k]
+	if expectedVersion == -1 {
+		if exists {
+			return nil, store.ErrConflict
+		}
+	} else if !exists || cur.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	version := int64(0)
+	if exists {
+		version = cur.Version + 1
+	}
+	entry := &store.BoardEntry{MissionID: lead.MissionID, Namespace: "lead-plan", Key: lead.ID,
+		Value: append([]byte(nil), value...), Version: version, UpdatedAt: now}
+	s.board[k] = entry
+	lease.ExpiresAt = now.Add(leaseTTL)
+	if agent := s.agents[actor.ID]; agent != nil {
+		agent.LastHeartbeat = now
+		if agent.Health == "suspect" {
+			agent.Health = "healthy"
+		}
+	}
+	s.appendEventLocked(lead.ID, lead.MissionID, "lead.snapshot.saved", map[string]any{
+		"version": version,
+	}, actor, now)
+	c := *entry
+	return &c, nil
+}
+
+func (s *Store) TakeoverStaleLeads(_ context.Context, now time.Time) ([]*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*mission.Subtask
+	for _, lead := range s.subtasks {
+		if lead.State != mission.StateRunning || lead.LeaseID == "" {
+			continue
+		}
+		lease := s.leases[lead.LeaseID]
+		if lease == nil || lease.State != store.LeaseActive || lease.ExpiresAt.After(now) {
+			continue
+		}
+		isLead := s.board[boardKey(lead.MissionID, "lead-plan", lead.ID)] != nil
+		if !isLead {
+			for _, child := range s.subtasks {
+				if child.ParentID == lead.ID {
+					isLead = true
+					break
+				}
+			}
+		}
+		if !isLead {
+			continue
+		}
+		if _, err := mission.Apply(lead.State, mission.EvTakeover); err != nil {
+			return out, store.ErrConflict
+		}
+		lease.State = store.LeaseFenced
+		if agent := s.agents[lease.AgentID]; agent != nil {
+			if agent.Running > 0 {
+				agent.Running--
+			}
+			if agent.Health != "down" {
+				agent.Health = "suspect"
+			}
+		}
+		oldAgent, oldLease := lead.Assignee, lead.LeaseID
+		lead.State, lead.Assignee, lead.LeaseID = mission.StateReady, "", ""
+		lead.Version++
+		s.appendEventLocked(lead.ID, lead.MissionID, string(mission.EvTakeover), map[string]any{
+			"state": string(mission.StateReady), "fenced_lease_id": oldLease, "previous_agent_id": oldAgent,
+		}, store.Actor{Kind: "system", ID: "lead-takeover"}, now)
+		c := *lead
+		out = append(out, &c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 func (s *Store) FailSubtask(_ context.Context, id string, fencingToken int64, reason string,
@@ -548,6 +959,9 @@ func (s *Store) FailSubtask(_ context.Context, id string, fencingToken int64, re
 	sub.State = mission.StateFailed
 	sub.Version++
 	s.releaseLeaseLocked(l)
+	if sub.Attempt >= sub.Retry.MaxAttempts {
+		s.releaseBudgetHoldLocked(sub, "final_failure", actor, now)
+	}
 	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvFailed), map[string]any{
 		"state":  string(mission.StateFailed),
 		"reason": reason,
@@ -599,6 +1013,35 @@ func (s *Store) BlockSubtask(_ context.Context, id string, fencingToken int64, e
 	return &c, nil
 }
 
+func (s *Store) CancelSubtask(_ context.Context, id string, expectedVersion int64,
+	actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subtasks[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if sub.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	if _, err := mission.Apply(sub.State, mission.EvCancelled); err != nil {
+		return nil, store.ErrConflict
+	}
+	if sub.LeaseID != "" {
+		if l, ok := s.leases[sub.LeaseID]; ok && l.State == store.LeaseActive {
+			s.releaseLeaseLocked(l)
+		}
+	}
+	sub.State = mission.StateCancelled
+	sub.Assignee, sub.LeaseID = "", ""
+	sub.Version++
+	s.releaseBudgetHoldLocked(sub, "cancelled", actor, now)
+	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvCancelled),
+		map[string]any{"state": string(mission.StateCancelled)}, actor, now)
+	c := *sub
+	return &c, nil
+}
+
 // ---- 挂起-唤醒（M3） ----
 
 func (s *Store) SuspendSubtask(_ context.Context, id string, fencingToken int64, expectedVersion int64,
@@ -634,7 +1077,7 @@ func (s *Store) SuspendSubtask(_ context.Context, id string, fencingToken int64,
 	s.releaseLeaseLocked(l)
 	sub.Assignee, sub.LeaseID = "", ""
 	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvSuspended), map[string]any{
-		"state":    string(mission.StateWaiting),
+		"state":     string(mission.StateWaiting),
 		"wake_kind": wake.Kind,
 	}, actor, now)
 	c := *sub
@@ -651,6 +1094,9 @@ func (s *Store) WakeSubtask(_ context.Context, id string, expectedVersion int64,
 	}
 	if sub.Version != expectedVersion {
 		return nil, store.ErrConflict // CAS 竞争：另一 sweeper/wake 已处理
+	}
+	if sub.WakeDeadline != nil && !sub.WakeDeadline.After(now) {
+		return nil, store.ErrConflict
 	}
 	if _, err := mission.Apply(sub.State, mission.EvWoken); err != nil {
 		return nil, store.ErrConflict
@@ -764,6 +1210,42 @@ func (s *Store) CreateDecision(_ context.Context, d *store.Decision, now time.Ti
 		map[string]any{"decision_id": d.ID, "question": d.Question, "options": d.Options},
 		store.Actor{Kind: "system", ID: "hitl"}, now)
 	return nil
+}
+
+func (s *Store) CreateDecisionAndBlock(_ context.Context, d *store.Decision, expectedSubVersion int64,
+	fencingToken *int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.decisions[d.ID]; ok {
+		return nil, store.ErrConflict
+	}
+	sub, ok := s.subtasks[d.SubtaskID]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if sub.Version != expectedSubVersion {
+		return nil, store.ErrConflict
+	}
+	if fencingToken != nil {
+		if _, err := s.checkFencingLocked(sub, *fencingToken); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := mission.Apply(sub.State, mission.EvBlocked); err != nil {
+		return nil, store.ErrConflict
+	}
+	sub.State = mission.StateBlocked
+	sub.Version++
+	c := *d
+	c.Status = store.DecisionPending
+	c.CreatedAt = now
+	s.decisions[d.ID] = &c
+	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvBlocked),
+		map[string]any{"state": string(mission.StateBlocked), "question": d.Question}, actor, now)
+	s.appendEventLocked(d.SubtaskID, d.MissionID, "decision.requested",
+		map[string]any{"decision_id": d.ID, "question": d.Question, "options": d.Options}, actor, now)
+	out := *sub
+	return &out, nil
 }
 
 func (s *Store) GetDecision(_ context.Context, id string) (*store.Decision, error) {

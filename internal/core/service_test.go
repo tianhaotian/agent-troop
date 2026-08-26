@@ -23,6 +23,23 @@ func newService() (*Service, *memory.Store, *clock.FakeClock) {
 	return New(st, clk, DefaultConfig()), st, clk
 }
 
+type failTransitionOnceStore struct {
+	store.Store
+	target string
+	event  mission.EventType
+	failed bool
+}
+
+func (s *failTransitionOnceStore) TransitionSubtask(ctx context.Context, id string, ev mission.EventType,
+	expectedVersion int64, actor store.Actor, payload map[string]any, now time.Time,
+	mutate func(*mission.Subtask) error) (*mission.Subtask, error) {
+	if !s.failed && id == s.target && ev == s.event {
+		s.failed = true
+		return nil, errors.New("injected transition failure")
+	}
+	return s.Store.TransitionSubtask(ctx, id, ev, expectedVersion, actor, payload, now, mutate)
+}
+
 func mustRegister(t *testing.T, s *Service, id string, maxConc int, skills ...string) {
 	t.Helper()
 	mustRegisterScopes(t, s, id, nil, maxConc, skills...)
@@ -114,6 +131,73 @@ func TestDAGValidation(t *testing.T) {
 		{Name: "a", Kind: mission.KindAgent}, {Name: "a", Kind: mission.KindAgent},
 	}); !errors.Is(err, ErrInvalidDAG) {
 		t.Fatalf("dup name must be rejected, got %v", err)
+	}
+}
+
+func TestAgentCallbacksRequireLeaseOwner(t *testing.T) {
+	s, _, clk := newService()
+	mustRegister(t, s, "agt_owner", 1, "work")
+	mustRegister(t, s, "agt_intruder", 1, "other")
+	m, err := s.CreateMission(ctx, "u1", "lease owner", []TaskSpec{
+		{Name: "task", Kind: mission.KindAgent, RequiredSkills: []string{"work"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateMission: %v", err)
+	}
+	if _, err := s.ScheduleOnce(ctx); err != nil {
+		t.Fatalf("ScheduleOnce: %v", err)
+	}
+	offers, err := s.ListOffers(ctx, "agt_owner")
+	if err != nil || len(offers) != 1 {
+		t.Fatalf("offers=%d err=%v", len(offers), err)
+	}
+	offer := offers[0]
+	token := fenceOf(t, s, offer.LeaseID)
+
+	if _, err := s.AcceptLease(ctx, offer.LeaseID, token, offer.Version, "agt_intruder"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign accept must be forbidden, got %v", err)
+	}
+	leased, err := s.AcceptLease(ctx, offer.LeaseID, token, offer.Version, "agt_owner")
+	if err != nil {
+		t.Fatalf("owner accept: %v", err)
+	}
+	if _, err := s.StartSubtask(ctx, leased.ID, token, leased.Version, "agt_intruder"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign start must be forbidden, got %v", err)
+	}
+	running, err := s.StartSubtask(ctx, leased.ID, token, leased.Version, "agt_owner")
+	if err != nil {
+		t.Fatalf("owner start: %v", err)
+	}
+	if err := s.Progress(ctx, running.ID, running.LeaseID, token, "agt_intruder", nil); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign progress must be forbidden, got %v", err)
+	}
+	if _, err := s.FailSubtask(ctx, running.ID, token, "boom", running.Version, "agt_intruder"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign fail must be forbidden, got %v", err)
+	}
+	deadline := clk.Now().Add(time.Hour)
+	if _, err := s.Suspend(ctx, running.ID, token, running.Version, "agt_intruder",
+		&mission.WakeSpec{Kind: mission.WakeManual, Deadline: &deadline}, nil); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign suspend must be forbidden, got %v", err)
+	}
+	if _, err := s.RequestDecision(ctx, running.ID, token, running.Version, "agt_intruder",
+		"continue?", nil); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign decision request must be forbidden, got %v", err)
+	}
+	if _, err := s.CompleteSubtask(ctx, running.ID, token, "owner-key", "artifact://done",
+		running.Version, "agt_intruder"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign complete must be forbidden, got %v", err)
+	}
+	done, err := s.CompleteSubtask(ctx, running.ID, token, "owner-key", "artifact://done",
+		running.Version, "agt_owner")
+	if err != nil || done.State != mission.StateSucceeded {
+		t.Fatalf("owner complete: state=%v err=%v", done, err)
+	}
+	if _, err := s.CompleteSubtask(ctx, running.ID, token, "owner-key", "artifact://done",
+		running.Version, "agt_owner"); !errors.Is(err, store.ErrDuplicate) {
+		t.Fatalf("owner idempotent replay after lease release: %v", err)
+	}
+	if final, err := s.GetMission(ctx, m.ID); err != nil || final.Status != mission.MissionSucceeded {
+		t.Fatalf("mission status=%v err=%v", final, err)
 	}
 }
 
@@ -267,6 +351,61 @@ func TestCancelMissionCascades(t *testing.T) {
 	final, _ := s.GetMission(ctx, m.ID)
 	if final.Status != mission.MissionCancelled {
 		t.Fatalf("mission = %s, want CANCELLED", final.Status)
+	}
+}
+
+func TestCancelMissionReleasesRunningLease(t *testing.T) {
+	s, _, _ := newService()
+	mustRegister(t, s, "agt_a", 1)
+	m, _ := s.CreateMission(ctx, "u1", "cancel running", []TaskSpec{{Name: "a", Kind: mission.KindAgent}})
+	running, token := startOne(t, s, "agt_a")
+	leaseID := running.LeaseID
+	if err := s.CancelMission(ctx, m.ID, "u1"); err != nil {
+		t.Fatalf("CancelMission: %v", err)
+	}
+	if err := s.RenewLease(ctx, leaseID, token); !errors.Is(err, store.ErrFenced) {
+		t.Fatalf("cancelled lease must be fenced, got %v", err)
+	}
+	agent, _ := s.GetAgent(ctx, "agt_a")
+	if agent.Running != 0 {
+		t.Fatalf("running capacity leaked after cancel: %d", agent.Running)
+	}
+}
+
+func TestCompletionReplayRepairsPropagation(t *testing.T) {
+	baseStore := memory.New()
+	wrapped := &failTransitionOnceStore{Store: baseStore, event: mission.EvDepsSatisfied}
+	clk := clock.NewFake(base)
+	s := New(wrapped, clk, DefaultConfig())
+	mustRegister(t, s, "agt_a", 1)
+	m, _ := s.CreateMission(ctx, "u1", "repair", []TaskSpec{
+		{Name: "a", Kind: mission.KindAgent},
+		{Name: "b", Kind: mission.KindAgent, DependsOn: []string{"a"}},
+	})
+	wrapped.target = subID(m.ID, "b")
+	running, token := startOne(t, s, "agt_a")
+	if _, err := s.CompleteSubtask(ctx, running.ID, token, "repair-key", "r", running.Version, "agt_a"); err == nil {
+		t.Fatal("first completion should surface injected propagation failure")
+	}
+	if _, err := s.CompleteSubtask(ctx, running.ID, token, "repair-key", "r", running.Version, "agt_a"); !errors.Is(err, store.ErrDuplicate) {
+		t.Fatalf("replay should remain deduplicated after repair, got %v", err)
+	}
+	if got := mustGet(t, s, m.ID, wrapped.target); got.State != mission.StateReady {
+		t.Fatalf("replay did not repair downstream: %s", got.State)
+	}
+}
+
+func TestCreateMissionPreservesInput(t *testing.T) {
+	s, _, _ := newService()
+	m, err := s.CreateMission(ctx, "u1", "input", []TaskSpec{
+		{Name: "a", Kind: mission.KindAgent, Input: map[string]any{"topic": "storage"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateMission: %v", err)
+	}
+	sub := mustGet(t, s, m.ID, subID(m.ID, "a"))
+	if sub.Input["topic"] != "storage" {
+		t.Fatalf("input was dropped: %+v", sub.Input)
 	}
 }
 

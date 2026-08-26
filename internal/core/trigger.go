@@ -94,6 +94,9 @@ func (s *Service) Suspend(ctx context.Context, subtaskID string, fencingToken, v
 	if err := validateWake(wake); err != nil {
 		return nil, err
 	}
+	if _, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, true); err != nil {
+		return nil, err
+	}
 	if len(checkpoint) > MaxCheckpointSize {
 		return nil, fmt.Errorf("core: checkpoint exceeds %d bytes", MaxCheckpointSize)
 	}
@@ -126,10 +129,13 @@ func (s *Service) Wake(ctx context.Context, subtaskID, actorID string) (*mission
 }
 
 // Progress progress 心跳：续租 + 检查点落库（fencing 校验在 store 层）。
-func (s *Service) Progress(ctx context.Context, subtaskID, leaseID string, fencingToken int64,
+func (s *Service) Progress(ctx context.Context, subtaskID, leaseID string, fencingToken int64, agentID string,
 	checkpoint json.RawMessage) error {
 	if len(checkpoint) > MaxCheckpointSize {
 		return fmt.Errorf("core: checkpoint exceeds %d bytes", MaxCheckpointSize)
+	}
+	if _, err := s.authorizeLeaseOwner(ctx, leaseID, subtaskID, fencingToken, agentID, true); err != nil {
+		return err
 	}
 	if err := s.st.RenewLease(ctx, leaseID, fencingToken, 2*s.cfg.OfferTTL, s.clk.Now()); err != nil {
 		return err
@@ -186,32 +192,44 @@ func (s *Service) evalEventWakes(ctx context.Context) error {
 		if w == nil || w.Event == nil {
 			continue
 		}
-		evs, err := s.st.ListMissionEvents(ctx, sub.MissionID, w.Event.AfterSeq, 200)
-		if err != nil {
-			return err
+		if w.Deadline != nil && !w.Deadline.After(s.clk.Now()) {
+			continue
 		}
-		for _, e := range evs {
-			matched := false
-			for _, typ := range w.Event.Types {
-				if e.Type == typ {
-					matched = true
-					break
+		after := w.Event.AfterSeq
+		woken := false
+		for {
+			evs, err := s.st.ListMissionEvents(ctx, sub.MissionID, after, 200)
+			if err != nil {
+				return err
+			}
+			for _, e := range evs {
+				matched := false
+				for _, typ := range w.Event.Types {
+					if e.Type == typ {
+						matched = true
+						break
+					}
 				}
+				if !matched || !matchWhere(e.Payload, w.Event.Where) {
+					continue
+				}
+				// CAS 竞争失败说明已被另一路唤醒。
+				_, _ = s.st.WakeSubtask(ctx, sub.ID, sub.Version,
+					store.Actor{Kind: "system", ID: "trigger"}, s.clk.Now())
+				woken = true
+				break
 			}
-			if !matched || !matchWhere(e.Payload, w.Event.Where) {
-				continue
+			if woken || len(evs) < 200 {
+				break
 			}
-			// CAS 竞争失败说明已被另一路唤醒，直接看下一个注册
-			_, _ = s.st.WakeSubtask(ctx, sub.ID, sub.Version,
-				store.Actor{Kind: "system", ID: "trigger"}, s.clk.Now())
-			break
+			after = evs[len(evs)-1].Seq
 		}
 	}
 	return nil
 }
 
 // evalCondition 条件求值分发（M5-H1）：expr 走 CEL 内核，否则走结构化谓词
-//（M4 路径，行为逐字节不变）。
+// （M4 路径，行为逐字节不变）。
 func (s *Service) evalCondition(ctx context.Context, sub *mission.Subtask, w *mission.WakeSpec) (bool, error) {
 	if w.Condition.Expr != "" {
 		return s.evalConditionExpr(ctx, sub, w)
@@ -273,6 +291,9 @@ func (s *Service) evalConditionWakes(ctx context.Context, missionID, changedBoar
 	for _, sub := range waiting {
 		w := wakeSpecOf(sub)
 		if w == nil || w.Condition == nil {
+			continue
+		}
+		if w.Deadline != nil && !w.Deadline.After(s.clk.Now()) {
 			continue
 		}
 		if changedBoard != "" && (sub.MissionID != missionID || !conditionRefsChanged(w.Condition, changedBoard)) {

@@ -3,7 +3,7 @@
 多智能体协同平台：跨 Agent 平台（OpenClaw / Hermes / 自研等）的任务拆解、中心化状态管理、调度与人在回路协作。
 
 - **设计文档**：[docs/design/multi-agent-collab-platform-design.md](docs/design/multi-agent-collab-platform-design.md)（22 节 + 附录，含架构、调度、触发体系、协作模式、质量/信誉/仿真/计量专题与技术选型 ADR）
-- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)、[M4 触发管道](docs/plan/M4-trigger-pipeline.md)、[M5 CEL 与授权](docs/plan/M5-cel-scope.md)、[M6 主子委托](docs/plan/M6-delegate.md)）
+- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付：[M1 MVP](docs/plan/M1-mvp.md)、[M2 人在回路](docs/plan/M2-hitl.md)、[M3 调度与挂起-唤醒](docs/plan/M3-sched-trigger.md)、[M4 触发管道](docs/plan/M4-trigger-pipeline.md)、[M5 CEL 与授权](docs/plan/M5-cel-scope.md)、[M6 主子委托](docs/plan/M6-delegate.md)、[M7A 生产可靠性基线](docs/plan/M7A-production-baseline.md)、[M7B Lead 恢复闭环](docs/plan/M7B-lead-recovery.md)、[M7C 预算预占与结算](docs/plan/M7C-budget-holds.md)、[M7D 权限与上下文包](docs/plan/M7D-context-permissions.md)）
 - **License**：[Apache 2.0](LICENSE)
 
 ## 开发流程约定（重要）
@@ -56,8 +56,16 @@ psql postgres://troop:troop@localhost:5432/troop -f migrations/0001_init.sql \
                                                -f migrations/0002_hitl_board.sql \
                                                -f migrations/0003_m3.sql \
                                                -f migrations/0004_m4.sql \
-                                               -f migrations/0005_m5.sql
+                                               -f migrations/0005_m5.sql \
+                                               -f migrations/0006_reliability.sql \
+                                               -f migrations/0007_lead_recovery.sql \
+                                               -f migrations/0008_budget.sql \
+                                               -f migrations/0009_context_packages.sql
 TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
+
+# 探针：healthz 只检查进程；readyz 会真实检查 Store（PG 不可用时返回 503）
+curl -f localhost:8080/healthz
+curl -f localhost:8080/readyz
 
 # 可选环境变量：TROOP_SCHEDULER=capability-first|round-robin（放置策略，M3）
 #               TROOP_BLOB_DIR=./data/artifacts（Artifact blob 目录）
@@ -68,7 +76,8 @@ TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
 ```bash
 # 1) progress 心跳携带检查点（fencing 校验；≤64KB 透明载荷，崩溃/换 Agent 后续跑用）
 curl -X POST localhost:8080/v1/subtasks/sub_xxx/progress -d '{
-  "lease_id":"lea_xxx", "fencing_token":3, "checkpoint":{"step":3,"partial":"..."}
+  "agent_id":"echo1", "lease_id":"lea_xxx", "fencing_token":3,
+  "checkpoint":{"step":3,"partial":"..."}
 }'
 
 # 2) Agent 挂起自身（RUNNING→WAITING，释放租约；wake_on 必带 TTL 防永久悬挂）
@@ -192,6 +201,86 @@ curl -X POST localhost:8080/v1/intents -d '{
 }'
 ```
 
+## M7B API 示例（Lead 快照 / 收件箱 / takeover）
+
+```bash
+# 1) Lead 心跳与计划快照原子提交：首次 expected_version=-1，之后使用响应 version 做 CAS
+curl -X POST localhost:8080/v1/subtasks/sub_lead/lead/heartbeat -d '{
+  "agent_id":"agt_lead", "fencing_token":5, "expected_version":-1,
+  "snapshot":{"dag_intent":"汇总调研结果","known":{"sub_research":"RUNNING"},
+              "artifacts":[],"next":"等待并验收"}
+}'
+
+# 2) child 完成后结果原子进入 Lead inbox；查询不会自动消费
+curl 'localhost:8080/v1/subtasks/sub_lead/lead/inbox?status=pending'
+# Lead 显式选择摄入粒度（summary|full），并以 inbox item version 做 CAS
+curl -X POST localhost:8080/v1/subtasks/sub_lead/lead/inbox/lin_sub_research/ingest -d '{
+  "agent_id":"agt_lead", "fencing_token":5, "expected_version":0, "mode":"summary"
+}'
+
+# 3) 继任 Lead 获取最近计划快照 + 完整收件箱（含 pending/ingested 状态），重建执行上下文
+curl localhost:8080/v1/subtasks/sub_lead/lead/context
+# Lead heartbeat 租约到期后，sweeper 会 fence 旧租约并把 Lead 任务送回 READY；
+# in-flight child 不受影响，新 Lead 经正常 Scheduler/lease 流程接管并获得新 fencing token。
+```
+
+## M7C API 示例（预算 hold / settle / release）
+
+```bash
+# 1) 创建带 100k token 硬顶的 Mission；不传 budget_tokens 则保持 unmetered
+curl -X POST localhost:8080/v1/missions -d '{
+  "owner":"me", "goal":"预算内完成调研", "budget_tokens":100000,
+  "tasks":[{"name":"lead","kind":"agent","required_skills":["lead.coordinate"]}]
+}'
+
+# 2) budgeted Mission 的 delegate 必须声明正数切片；创建 child 与 60k hold 同事务
+curl -X POST localhost:8080/v1/intents -d '{
+  "source":{"kind":"agent","id":"agt_lead"},
+  "action":"delegate", "idempotency_key":"dlg-budget-1",
+  "parent_subtask_id":"sub_lead", "fencing_token":5, "parent_version":6,
+  "task":{"name":"research","required_skills":["web.research"],"budget_tokens":60000}
+}'
+
+# 3) child 完成时上报实际用量：hold 释放，45k 计入 spent，15k 自动退回 available
+curl -X POST localhost:8080/v1/subtasks/sub_research/complete -d '{
+  "agent_id":"agt_worker", "fencing_token":8, "version":4,
+  "idempotency_key":"complete-budget-1", "result_ref":"artifact://research",
+  "usage_tokens":45000
+}'
+
+# 4) 查询账户与全部 hold 明细；最终失败或取消会把 HELD 原子变为 RELEASED
+curl localhost:8080/v1/missions/msn_xxx/budget
+```
+
+## M7D API 示例（权限衰减 / 上下文包）
+
+```bash
+# 1) 根任务声明权限包络；未声明 grants 的旧任务保持最小权限（public、无数据视图）
+curl -X POST localhost:8080/v1/missions -d '{
+  "owner":"me", "goal":"最小知情调研",
+  "tasks":[{"name":"lead","kind":"agent","required_skills":["lead.coordinate"],
+    "grants":{"classification":"internal","tool_scopes":["search"],
+      "artifact_refs":["art_xxx"],
+      "board_views":[{"namespace":"shared","keys":["glossary"],"mode":"rw"}]}}]
+}'
+
+# 2) delegate grants 必须是 parent 的子集：public ≤ internal、ro ≤ rw，且不能新增 key/tool/artifact
+curl -X POST localhost:8080/v1/intents -d '{
+  "source":{"kind":"agent","id":"agt_lead"},
+  "action":"delegate", "idempotency_key":"dlg-context-1",
+  "parent_subtask_id":"sub_lead", "fencing_token":5, "parent_version":6,
+  "task":{"name":"research","required_skills":["web.research"],
+    "grants":{"classification":"public","tool_scopes":["search"],
+      "artifact_refs":["art_xxx"],
+      "board_views":[{"namespace":"shared","keys":["glossary"],"mode":"ro"}]}}
+}'
+
+# 3) offer 已携带不可变 context_package；也可按 lease 读取同一快照
+curl localhost:8080/v1/agents/agt_worker/offers
+curl localhost:8080/v1/leases/les_xxx/context
+# snapshot_hash 记入 context.materialized 事件，可审计该 Agent 当时看到的精确视图。
+```
+
 ## M2 API 示例（人在回路 / 黑板 / Artifact）
 
 ```bash
@@ -238,4 +327,8 @@ curl localhost:8080/v1/artifacts/art_xxx/content   # 响应头带 X-Artifact-SHA
 - **M4 ✅**：event/condition 唤醒（水位线语义 + 增量评估 + sweeper 兜底）+ TaskIntent 准入管道（/v1/intents 幂等 create_mission / wake）（[计划](docs/plan/M4-trigger-pipeline.md)）
 - **M5 ✅**：CEL 条件内核（cel-go：静态/运行时 cost 双闸 + 静态引用提取 + 逻辑时钟函数）+ scope 三级授权（trigger_scopes 默认收紧，鉴权先于去重）（[计划](docs/plan/M5-cel-scope.md)）
 - **M6 ✅**：主子委托协议核心（delegate 准入 + fencing 委托权 + 幂等派生 + depth/fanout 校验 + rework 链式重派 + 子女完成精确唤醒）（[计划](docs/plan/M6-delegate.md)）
-- **M7（当前）**：Lead 收件箱/计划快照/失联容错（§15.2-15.4）、预算池（§15.5）、上下文包（§16）、A2A/MCP 适配、托管 Adapter
+- **M7A ✅**：生产可靠性基线（readiness、Agent/租约归属校验、PG CI 门禁与迁移重放）（[计划](docs/plan/M7A-production-baseline.md)）
+- **M7B ✅**：Lead 收件箱/计划快照/失联 takeover（[计划](docs/plan/M7B-lead-recovery.md)）
+- **M7C ✅**：Mission 预算池、delegate 原子 hold 与完成/失败/取消结算（[计划](docs/plan/M7C-budget-holds.md)）
+- **M7D ✅ / M7 完成**：权限包络衰减、lease 级不可变上下文包、最小知情视图与 SHA-256 审计（[计划](docs/plan/M7D-context-permissions.md)）
+- **M8（下一阶段）**：A2A/MCP 协议适配、外部身份认证、签名资源 URL 与托管 Adapter

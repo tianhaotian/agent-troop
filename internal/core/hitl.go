@@ -56,13 +56,12 @@ func (s *Service) OpenHumanDecisions(ctx context.Context) (int, error) {
 			Deadline:  sub.Scheduling.Deadline,
 			OnTimeout: sub.OnTimeout,
 		}
-		// 先迁移 READY→BLOCKED（CAS 保证单胜者），再落工单
-		if _, err := s.st.TransitionSubtask(ctx, sub.ID, mission.EvBlocked, sub.Version,
-			store.Actor{Kind: "system", ID: "hitl"},
-			map[string]any{"question": question}, now, nil); err != nil {
-			continue // 并发下已被处理
-		}
-		if err := s.st.CreateDecision(ctx, d, now); err != nil {
+		// READY→BLOCKED 与工单创建在同一存储事务内完成。
+		if _, err := s.st.CreateDecisionAndBlock(ctx, d, sub.Version, nil,
+			store.Actor{Kind: "system", ID: "hitl"}, now); err != nil {
+			if err == store.ErrConflict {
+				continue // 并发下已被处理
+			}
 			return opened, err
 		}
 		opened++
@@ -74,9 +73,11 @@ func (s *Service) OpenHumanDecisions(ctx context.Context) (int, error) {
 func (s *Service) RequestDecision(ctx context.Context, subtaskID string, fencingToken, version int64,
 	agentID, question string, options []string) (*store.Decision, error) {
 	now := s.clk.Now()
-	sub, err := s.st.BlockSubtask(ctx, subtaskID, fencingToken, version,
-		store.Actor{Kind: "agent", ID: agentID}, now)
+	sub, err := s.findRunning(ctx, subtaskID)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, true); err != nil {
 		return nil, err
 	}
 	if len(options) == 0 {
@@ -90,7 +91,8 @@ func (s *Service) RequestDecision(ctx context.Context, subtaskID string, fencing
 		Question:  question,
 		Options:   options,
 	}
-	if err := s.st.CreateDecision(ctx, d, now); err != nil {
+	if _, err := s.st.CreateDecisionAndBlock(ctx, d, version, &fencingToken,
+		store.Actor{Kind: "agent", ID: agentID}, now); err != nil {
 		return nil, err
 	}
 	return d, nil

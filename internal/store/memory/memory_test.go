@@ -245,7 +245,7 @@ func TestSpawnSubtask(t *testing.T) {
 		child, agtA, clk.Now()); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("stale version: %v", err)
 	}
-	// 正常派生：PENDING + parent_id + 事件留痕
+	// 正常派生：原子 READY + parent_id + 事件留痕
 	if _, err := s.SpawnSubtask(ctx, "dlg-1", "sub_a", l1.FencingToken, parent.Version,
 		child, agtA, clk.Now()); err != nil {
 		t.Fatalf("spawn: %v", err)
@@ -257,7 +257,7 @@ func TestSpawnSubtask(t *testing.T) {
 			got = x
 		}
 	}
-	if got == nil || got.State != mission.StatePending || got.ParentID != "sub_a" || got.Input["topic"] != "t" {
+	if got == nil || got.State != mission.StateReady || got.ParentID != "sub_a" || got.Input["topic"] != "t" {
 		t.Fatalf("child = %+v", got)
 	}
 	// 幂等重放：同键返回原子女 ID + ErrDuplicate

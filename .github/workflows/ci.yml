@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: troop
+          POSTGRES_PASSWORD: troop
+          POSTGRES_DB: troop
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U troop -d troop"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TROOP_TEST_PG: postgres://troop:troop@localhost:5432/troop?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit and PostgreSQL integration tests
+        run: go test -count=1 ./...
+      - name: Static analysis
+        run: go vet ./...
+      - name: Race detector
+        run: go test -race ./internal/...
+      - name: End-to-end tests
+        run: go test -tags e2e ./e2e/
+      - name: PostgreSQL migration and store gate
+        run: go test -count=1 ./internal/store/pg

@@ -30,13 +30,14 @@ var ErrForbidden = errors.New("core: forbidden")
 
 // Intent 统一触发意图（API 触发 / Agent 主动触发归一化后的形态）。
 type Intent struct {
-	Source         store.Actor `json:"source"`           // 触发者（kind: human|agent）
-	Action         string      `json:"action"`           // create_mission | wake | delegate
-	IdempotencyKey string      `json:"idempotency_key"`  // create_mission / delegate 必填
-	Owner          string      `json:"owner,omitempty"`  // create_mission
-	Goal           string      `json:"goal,omitempty"`   // create_mission
-	Tasks          []TaskSpec  `json:"tasks,omitempty"`  // create_mission
-	SubtaskID      string      `json:"subtask_id,omitempty"` // wake
+	Source         store.Actor `json:"source"`                  // 触发者（kind: human|agent）
+	Action         string      `json:"action"`                  // create_mission | wake | delegate
+	IdempotencyKey string      `json:"idempotency_key"`         // create_mission / delegate 必填
+	Owner          string      `json:"owner,omitempty"`         // create_mission
+	Goal           string      `json:"goal,omitempty"`          // create_mission
+	Tasks          []TaskSpec  `json:"tasks,omitempty"`         // create_mission
+	BudgetTokens   int64       `json:"budget_tokens,omitempty"` // create_mission token 硬顶
+	SubtaskID      string      `json:"subtask_id,omitempty"`    // wake
 	// delegate（M6）：Lead 持父任务租约派生子女
 	ParentSubtaskID string        `json:"parent_subtask_id,omitempty"`
 	FencingToken    int64         `json:"fencing_token,omitempty"`
@@ -46,9 +47,9 @@ type Intent struct {
 
 // IntentResult 准入结果。
 type IntentResult struct {
-	MissionID     string `json:"mission_id,omitempty"`
-	SubtaskID     string `json:"subtask_id,omitempty"`
-	Deduplicated  bool   `json:"deduplicated,omitempty"`
+	MissionID    string `json:"mission_id,omitempty"`
+	SubtaskID    string `json:"subtask_id,omitempty"`
+	Deduplicated bool   `json:"deduplicated,omitempty"`
 }
 
 // SubmitIntent 准入管道：鉴权（agent source）→ 校验 → 幂等 → 实例化。
@@ -115,6 +116,9 @@ func (s *Service) intentCreateMission(ctx context.Context, in Intent) (*IntentRe
 	if in.Owner == "" || in.Goal == "" || len(in.Tasks) == 0 {
 		return nil, fmt.Errorf("core: owner/goal/tasks required")
 	}
+	if in.BudgetTokens < 0 {
+		return nil, fmt.Errorf("%w: budget_tokens must be >= 0", ErrInvalidBudget)
+	}
 	if err := validateDAG(in.Tasks); err != nil { // 早失败：不占用幂等键
 		return nil, err
 	}
@@ -123,12 +127,24 @@ func (s *Service) intentCreateMission(ctx context.Context, in Intent) (*IntentRe
 	id := newID("msn")
 	existing, err := s.st.PutIdempotent(ctx, "intent-"+in.IdempotencyKey, id, s.clk.Now())
 	if errors.Is(err, store.ErrDuplicate) {
+		if _, getErr := s.st.GetMission(ctx, existing); errors.Is(getErr, store.ErrNotFound) {
+			if _, createErr := s.createMission(ctx, existing, in.Source, in.Owner, in.Goal, in.BudgetTokens, in.Tasks); createErr != nil {
+				if _, retryGetErr := s.st.GetMission(ctx, existing); retryGetErr != nil {
+					return nil, createErr
+				}
+			}
+		} else if getErr != nil {
+			return nil, getErr
+		}
+		if activateErr := s.activateMissionRoots(ctx, existing, in.Source); activateErr != nil {
+			return nil, activateErr
+		}
 		return &IntentResult{MissionID: existing, Deduplicated: true}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.createMission(ctx, id, in.Source, in.Owner, in.Goal, in.Tasks); err != nil {
+	if _, err := s.createMission(ctx, id, in.Source, in.Owner, in.Goal, in.BudgetTokens, in.Tasks); err != nil {
 		return nil, err
 	}
 	return &IntentResult{MissionID: id}, nil

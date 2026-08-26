@@ -84,6 +84,17 @@ func TestDelegateHappyPath(t *testing.T) {
 	}
 }
 
+func TestDelegateRequiresParentLeaseOwner(t *testing.T) {
+	s, _, _ := newService()
+	_, parent, token := setupLead(t, s)
+	mustRegisterScopes(t, s, "agt_intruder", []string{ScopeSpawnSubtask}, 1, "lead.coordinate")
+	in := delegateIntent(parent, token, "dlg-owner", &DelegateSpec{Name: "foreign"})
+	in.Source.ID = "agt_intruder"
+	if _, err := s.SubmitIntent(ctx, in); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign delegate must be forbidden, got %v", err)
+	}
+}
+
 func TestDelegateScopeEnforced(t *testing.T) {
 	s, _, _ := newService()
 	// 无 spawn_subtask scope 的 Lead

@@ -37,6 +37,8 @@ func Connect(ctx context.Context, dsn string) (*Store, error) {
 
 func (s *Store) Close() { s.pool.Close() }
 
+func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+
 // ---- helpers ----
 
 func js(v any) ([]byte, error) { return json.Marshal(v) }
@@ -72,12 +74,13 @@ func scanSubtask(row pgx.Row) (*mission.Subtask, error) {
 		sub.ResultRef = *resultRef
 	}
 	var specObj struct {
-		RequiredSkills []string       `json:"required_skills"`
-		Question       string         `json:"question"`
-		Options        []string       `json:"options"`
-		OnTimeout      string         `json:"on_timeout"`
-		Input          map[string]any `json:"input"`     // M6：delegate 子女任务载荷
-		ReworkOf       string         `json:"rework_of"` // M6：rework 链
+		RequiredSkills []string                   `json:"required_skills"`
+		Question       string                     `json:"question"`
+		Options        []string                   `json:"options"`
+		OnTimeout      string                     `json:"on_timeout"`
+		Input          map[string]any             `json:"input"`     // M6：delegate 子女任务载荷
+		ReworkOf       string                     `json:"rework_of"` // M6：rework 链
+		Grants         mission.PermissionEnvelope `json:"grants"`    // M7D：权限包络
 	}
 	_ = json.Unmarshal(spec, &specObj)
 	sub.RequiredSkills = specObj.RequiredSkills
@@ -86,6 +89,7 @@ func scanSubtask(row pgx.Row) (*mission.Subtask, error) {
 	sub.OnTimeout = specObj.OnTimeout
 	sub.Input = specObj.Input
 	sub.ReworkOf = specObj.ReworkOf
+	sub.Grants = specObj.Grants
 	_ = json.Unmarshal(scheduling, &sub.Scheduling)
 	_ = json.Unmarshal(retry, &sub.Retry)
 	return &sub, nil
@@ -100,6 +104,7 @@ func marshalSpec(sub *mission.Subtask) []byte {
 		"on_timeout":      sub.OnTimeout,
 		"input":           sub.Input,
 		"rework_of":       sub.ReworkOf,
+		"grants":          sub.Grants,
 	})
 	return spec
 }
@@ -151,8 +156,16 @@ func (s *Store) CreateMission(ctx context.Context, m *mission.Mission, subs []*m
 		 VALUES ($1,$2,$3,'{}',$4,0,$5,$5)`, m.ID, m.Owner, m.Goal, string(m.Status), now); err != nil {
 		return store.ErrConflict
 	}
+	if m.BudgetTokens > 0 {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO mission_budgets
+			 (mission_id, total_tokens, held_tokens, spent_tokens, version, updated_at)
+			 VALUES ($1,$2,0,0,0,$3)`, m.ID, m.BudgetTokens, now); err != nil {
+			return err
+		}
+	}
 	ev := &store.Event{AggregateID: m.ID, MissionID: m.ID, Type: "mission.created",
-		Payload: map[string]any{"goal": m.Goal, "owner": m.Owner}, Actor: actor, Ts: now}
+		Payload: map[string]any{"goal": m.Goal, "owner": m.Owner, "budget_tokens": m.BudgetTokens}, Actor: actor, Ts: now}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err
 	}
@@ -181,8 +194,9 @@ func (s *Store) GetMission(ctx context.Context, id string) (*mission.Mission, er
 	var m mission.Mission
 	var status string
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, owner, goal, status, version FROM missions WHERE id=$1`, id).
-		Scan(&m.ID, &m.Owner, &m.Goal, &status, &m.Version)
+		`SELECT m.id, m.owner, m.goal, COALESCE(b.total_tokens,0), m.status, m.version
+		 FROM missions m LEFT JOIN mission_budgets b ON b.mission_id=m.id WHERE m.id=$1`, id).
+		Scan(&m.ID, &m.Owner, &m.Goal, &m.BudgetTokens, &status, &m.Version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -191,6 +205,54 @@ func (s *Store) GetMission(ctx context.Context, id string) (*mission.Mission, er
 	}
 	m.Status = mission.MissionStatus(status)
 	return &m, nil
+}
+
+func (s *Store) GetMissionBudget(ctx context.Context, missionID string) (*store.BudgetAccount, error) {
+	var account store.BudgetAccount
+	var exists bool
+	var updatedAt *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT m.id, b.mission_id IS NOT NULL, COALESCE(b.total_tokens,0),
+		 COALESCE(b.held_tokens,0), COALESCE(b.spent_tokens,0), COALESCE(b.version,0), b.updated_at
+		 FROM missions m LEFT JOIN mission_budgets b ON b.mission_id=m.id WHERE m.id=$1`, missionID).
+		Scan(&account.MissionID, &exists, &account.Total, &account.Held, &account.Spent,
+			&account.Version, &updatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	account.Metered = exists
+	account.Available = account.Total - account.Held - account.Spent
+	if updatedAt != nil {
+		account.UpdatedAt = *updatedAt
+	}
+	return &account, nil
+}
+
+func (s *Store) ListBudgetHolds(ctx context.Context, missionID string) ([]*store.BudgetHold, error) {
+	if _, err := s.GetMissionBudget(ctx, missionID); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, mission_id, subtask_id, attempt, amount_tokens, actual_tokens,
+		 status, created_at, settled_at
+		 FROM budget_holds WHERE mission_id=$1 ORDER BY created_at, id`, missionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*store.BudgetHold
+	for rows.Next() {
+		var hold store.BudgetHold
+		if err := rows.Scan(&hold.ID, &hold.MissionID, &hold.SubtaskID, &hold.Attempt,
+			&hold.Amount, &hold.Actual, &hold.Status, &hold.CreatedAt, &hold.SettledAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &hold)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListSubtasks(ctx context.Context, missionID string) ([]*mission.Subtask, error) {
@@ -430,7 +492,7 @@ func (s *Store) HeartbeatAgent(ctx context.Context, id string, now time.Time) er
 		   jsonb_set(health,'{last_heartbeat}',to_jsonb($2::text)),
 		   '{status}', to_jsonb(CASE WHEN health->>'status'='suspect' THEN 'healthy'
 		                             ELSE health->>'status' END)),
-		 updated_at=$2 WHERE id=$1`, id, now.Format(time.RFC3339Nano))
+		 updated_at=$2 WHERE id=$1`, id, now)
 	if err != nil {
 		return err
 	}
@@ -498,13 +560,133 @@ func (s *Store) OfferLease(ctx context.Context, subtaskID, agentID string, expec
 	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
 		return nil, err
 	}
+	pkg, err := buildContextPackageTx(ctx, tx, lease.ID, sub, now)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(pkg)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO context_packages
+		 (id, lease_id, mission_id, subtask_id, payload, snapshot_hash, created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7)`, pkg.ID, lease.ID, sub.MissionID, sub.ID,
+		payload, pkg.SnapshotHash, now); err != nil {
+		return nil, err
+	}
 	ev := &store.Event{AggregateID: subtaskID, MissionID: sub.MissionID, Type: string(mission.EvLeaseOffered),
 		Payload: map[string]any{"state": string(mission.StateOffered), "agent_id": agentID,
 			"lease_id": lease.ID, "fencing_token": fence}, Actor: actor, Ts: now}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return nil, err
 	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+		Type: "context.materialized", Payload: map[string]any{
+			"context_package_id": pkg.ID, "lease_id": lease.ID, "snapshot_hash": pkg.SnapshotHash,
+		}, Actor: store.Actor{Kind: "system", ID: "context-builder"}, Ts: now}); err != nil {
+		return nil, err
+	}
 	return &lease, tx.Commit(ctx)
+}
+
+func buildContextPackageTx(ctx context.Context, tx pgx.Tx, leaseID string, sub *mission.Subtask,
+	now time.Time) (*store.ContextPackage, error) {
+	var artifacts []*store.Artifact
+	if len(sub.Grants.ArtifactRefs) > 0 {
+		rows, err := tx.Query(ctx,
+			`SELECT id, sha256, mission_id, produced_by, schema_ref, size, created_at
+			 FROM artifacts WHERE id=ANY($1) AND mission_id=$2`, sub.Grants.ArtifactRefs, sub.MissionID)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var artifact store.Artifact
+			var producedBy, schemaRef *string
+			if err := rows.Scan(&artifact.ID, &artifact.SHA256, &artifact.MissionID, &producedBy,
+				&schemaRef, &artifact.Size, &artifact.CreatedAt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if producedBy != nil {
+				artifact.ProducedBy = *producedBy
+			}
+			if schemaRef != nil {
+				artifact.SchemaRef = *schemaRef
+			}
+			artifacts = append(artifacts, &artifact)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	views := map[string]*store.ContextBoardEntry{}
+	for _, grant := range sub.Grants.BoardViews {
+		rows, err := tx.Query(ctx,
+			`SELECT namespace, key, value, version FROM board_entries
+			 WHERE mission_id=$1 AND namespace=$2 AND (cardinality($3::text[])=0 OR key=ANY($3))`,
+			sub.MissionID, grant.Namespace, grant.Keys)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var entry store.ContextBoardEntry
+			if err := rows.Scan(&entry.Namespace, &entry.Key, &entry.Value, &entry.Version); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			entry.Mode = grant.Mode
+			key := entry.Namespace + "\x00" + entry.Key
+			current := views[key]
+			if current == nil || current.Mode == mission.BoardModeReadOnly && grant.Mode == mission.BoardModeReadWrite {
+				cp := entry
+				views[key] = &cp
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	board := make([]*store.ContextBoardEntry, 0, len(views))
+	for _, view := range views {
+		board = append(board, view)
+	}
+	rows, err := tx.Query(ctx, `SELECT `+decisionCols+` FROM decisions WHERE subtask_id=$1`, sub.ID)
+	if err != nil {
+		return nil, err
+	}
+	var decisions []*store.Decision
+	for rows.Next() {
+		decision, err := scanDecision(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		decisions = append(decisions, decision)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	var budget store.BudgetAccount
+	var budgetPtr *store.BudgetAccount
+	err = tx.QueryRow(ctx,
+		`SELECT mission_id, total_tokens, held_tokens, spent_tokens, version, updated_at
+		 FROM mission_budgets WHERE mission_id=$1`, sub.MissionID).
+		Scan(&budget.MissionID, &budget.Total, &budget.Held, &budget.Spent, &budget.Version, &budget.UpdatedAt)
+	if err == nil {
+		budget.Metered = true
+		budget.Available = budget.Total - budget.Held - budget.Spent
+		budgetPtr = &budget
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	return store.BuildContextPackage(leaseID, sub, artifacts, board, decisions, budgetPtr, now)
 }
 
 // loadActiveLease 校验子任务的活跃租约与 fencing token。
@@ -523,6 +705,29 @@ func loadActiveLease(ctx context.Context, tx pgx.Tx, sub *mission.Subtask, fenci
 		return err
 	}
 	if state != store.LeaseActive || token != fencingToken {
+		return store.ErrFenced
+	}
+	return nil
+}
+
+func loadOwnedActiveLease(ctx context.Context, tx pgx.Tx, sub *mission.Subtask,
+	fencingToken int64, agentID string, now time.Time) error {
+	if sub.LeaseID == "" {
+		return store.ErrFenced
+	}
+	var token int64
+	var state, owner string
+	var expiresAt time.Time
+	err := tx.QueryRow(ctx,
+		`SELECT fencing_token, state, agent_id, expires_at FROM leases WHERE id=$1 FOR UPDATE`, sub.LeaseID).
+		Scan(&token, &state, &owner, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.ErrFenced
+	}
+	if err != nil {
+		return err
+	}
+	if state != store.LeaseActive || token != fencingToken || owner != agentID || !expiresAt.After(now) {
 		return store.ErrFenced
 	}
 	return nil
@@ -609,6 +814,22 @@ func (s *Store) GetLease(ctx context.Context, id string) (*store.Lease, error) {
 	return &l, err
 }
 
+func (s *Store) GetContextPackage(ctx context.Context, leaseID string) (*store.ContextPackage, error) {
+	var payload []byte
+	err := s.pool.QueryRow(ctx, `SELECT payload FROM context_packages WHERE lease_id=$1`, leaseID).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var pkg store.ContextPackage
+	if err := json.Unmarshal(payload, &pkg); err != nil {
+		return nil, err
+	}
+	return &pkg, nil
+}
+
 func (s *Store) RenewLease(ctx context.Context, leaseID string, fencingToken int64, ttl time.Duration, now time.Time) error {
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE leases SET expires_at=$1 WHERE id=$2 AND fencing_token=$3 AND state='ACTIVE'`,
@@ -630,7 +851,10 @@ func (s *Store) ExpireLeases(ctx context.Context, now time.Time) (int, error) {
 	defer tx.Rollback(ctx)
 
 	rows, err := tx.Query(ctx,
-		`SELECT id, subtask_id FROM leases WHERE state='ACTIVE' AND expires_at<=$1 FOR UPDATE`, now)
+		`SELECT l.id, l.subtask_id FROM leases l
+		 JOIN subtasks s ON s.id=l.subtask_id
+		 WHERE l.state='ACTIVE' AND l.expires_at<=$1 AND s.state IN ('OFFERED','LEASED')
+		 FOR UPDATE OF l, s`, now)
 	if err != nil {
 		return 0, err
 	}
@@ -651,7 +875,7 @@ func (s *Store) ExpireLeases(ctx context.Context, now time.Time) (int, error) {
 		if _, err := tx.Exec(ctx, `UPDATE leases SET state='EXPIRED' WHERE id=$1`, e.leaseID); err != nil {
 			return n, err
 		}
-		// 仅回收尚未开始执行的（OFFERED/LEASED）；RUNNING 的活性由心跳/熔断负责（M1 边界）
+		// 查询已限定 OFFERED/LEASED；RUNNING Lead 由 takeover 原子 fence，不能先过期租约。
 		tag, err := tx.Exec(ctx,
 			`UPDATE subtasks SET state='READY', assignee_agent_id=NULL, lease_id=NULL,
 			 version=version+1, updated_at=$1
@@ -684,6 +908,11 @@ func (s *Store) StartSubtask(ctx context.Context, id string, fencingToken int64,
 
 func (s *Store) CompleteSubtask(ctx context.Context, id string, fencingToken int64, idemKey, resultRef string,
 	expectedVersion int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	return s.CompleteSubtaskWithUsage(ctx, id, fencingToken, idemKey, resultRef, 0, expectedVersion, actor, now)
+}
+
+func (s *Store) CompleteSubtaskWithUsage(ctx context.Context, id string, fencingToken int64, idemKey, resultRef string,
+	usageTokens, expectedVersion int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -719,6 +948,9 @@ func (s *Store) CompleteSubtask(ctx context.Context, id string, fencingToken int
 	if _, err := mission.Apply(sub.State, mission.EvCompleted); err != nil {
 		return nil, store.ErrConflict
 	}
+	if err := settleBudgetHold(ctx, tx, sub, usageTokens, actor, now); err != nil {
+		return nil, err
+	}
 	sub.State = mission.StateSucceeded
 	sub.ResultRef = resultRef
 	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
@@ -740,13 +972,122 @@ func (s *Store) CompleteSubtask(ctx context.Context, id string, fencingToken int
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return nil, err
 	}
+	if sub.ParentID != "" {
+		itemID := store.LeadInboxID(sub.ID)
+		tag, err := tx.Exec(ctx,
+			`INSERT INTO lead_inbox
+			 (id, mission_id, lead_subtask_id, source_subtask_id, kind, result_ref, status, created_at)
+			 VALUES ($1,$2,$3,$4,'result',$5,$6,$7)
+			 ON CONFLICT (source_subtask_id) DO NOTHING`,
+			itemID, sub.MissionID, sub.ParentID, sub.ID, resultRef, store.LeadInboxPending, now)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() > 0 {
+			if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ParentID, MissionID: sub.MissionID,
+				Type: "lead.inbox.enqueued", Payload: map[string]any{
+					"item_id": itemID, "source_subtask_id": sub.ID, "result_ref": resultRef,
+				}, Actor: store.Actor{Kind: "system", ID: "lead-inbox"}, Ts: now}); err != nil {
+				return nil, err
+			}
+		}
+	}
 	sub.Version++
 	return sub, tx.Commit(ctx)
 }
 
+func settleBudgetHold(ctx context.Context, tx pgx.Tx, sub *mission.Subtask, usageTokens int64,
+	actor store.Actor, now time.Time) error {
+	var hold store.BudgetHold
+	err := tx.QueryRow(ctx,
+		`SELECT id, mission_id, subtask_id, attempt, amount_tokens, actual_tokens,
+		 status, created_at, settled_at
+		 FROM budget_holds WHERE subtask_id=$1 FOR UPDATE`, sub.ID).
+		Scan(&hold.ID, &hold.MissionID, &hold.SubtaskID, &hold.Attempt, &hold.Amount,
+			&hold.Actual, &hold.Status, &hold.CreatedAt, &hold.SettledAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if hold.Status != store.BudgetHoldHeld {
+		return nil
+	}
+	if usageTokens < 0 {
+		return store.ErrBudgetExceeded
+	}
+	var total, held, spent int64
+	if err := tx.QueryRow(ctx,
+		`SELECT total_tokens, held_tokens, spent_tokens
+		 FROM mission_budgets WHERE mission_id=$1 FOR UPDATE`, sub.MissionID).
+		Scan(&total, &held, &spent); err != nil {
+		return err
+	}
+	otherHeld := held - hold.Amount
+	if otherHeld < 0 || usageTokens > total-spent-otherHeld {
+		return store.ErrBudgetExceeded
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE mission_budgets SET held_tokens=$2, spent_tokens=$3, version=version+1, updated_at=$4
+		 WHERE mission_id=$1`, sub.MissionID, otherHeld, spent+usageTokens, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE budget_holds SET actual_tokens=$2, status=$3, settled_at=$4 WHERE id=$1`,
+		hold.ID, usageTokens, store.BudgetHoldSettled, now); err != nil {
+		return err
+	}
+	return appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+		Type: "budget.settled", Payload: map[string]any{
+			"hold_id": hold.ID, "reserved_tokens": hold.Amount, "actual_tokens": usageTokens,
+			"available_tokens": total - otherHeld - spent - usageTokens,
+		}, Actor: actor, Ts: now})
+}
+
+func releaseBudgetHold(ctx context.Context, tx pgx.Tx, sub *mission.Subtask, reason string,
+	actor store.Actor, now time.Time) error {
+	var holdID string
+	var amount int64
+	err := tx.QueryRow(ctx,
+		`SELECT id, amount_tokens FROM budget_holds
+		 WHERE subtask_id=$1 AND status=$2 FOR UPDATE`, sub.ID, store.BudgetHoldHeld).
+		Scan(&holdID, &amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var total, held, spent int64
+	if err := tx.QueryRow(ctx,
+		`SELECT total_tokens, held_tokens, spent_tokens FROM mission_budgets
+		 WHERE mission_id=$1 FOR UPDATE`, sub.MissionID).Scan(&total, &held, &spent); err != nil {
+		return err
+	}
+	if held < amount {
+		return store.ErrConflict
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE mission_budgets SET held_tokens=held_tokens-$2, version=version+1, updated_at=$3
+		 WHERE mission_id=$1`, sub.MissionID, amount, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE budget_holds SET status=$2, settled_at=$3 WHERE id=$1`,
+		holdID, store.BudgetHoldReleased, now); err != nil {
+		return err
+	}
+	return appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+		Type: "budget.released", Payload: map[string]any{
+			"hold_id": holdID, "amount_tokens": amount, "reason": reason,
+			"available_tokens": total - (held - amount) - spent,
+		}, Actor: actor, Ts: now})
+}
+
 // ---- 主子委托（M6，§15.1） ----
 
-// SpawnSubtask 原子完成：幂等去重 → 父任务 fencing + RUNNING 校验 → 子女插入（PENDING）。
+// SpawnSubtask 原子完成：幂等去重 → 父任务 fencing + RUNNING 校验 → 子女插入并激活 READY。
 func (s *Store) SpawnSubtask(ctx context.Context, idemKey, parentID string, fencingToken, parentVersion int64,
 	child *mission.Subtask, actor store.Actor, now time.Time) (string, error) {
 	tx, err := s.pool.Begin(ctx)
@@ -772,20 +1113,41 @@ func (s *Store) SpawnSubtask(ctx context.Context, idemKey, parentID string, fenc
 	if parent.Version != parentVersion {
 		return "", store.ErrConflict
 	}
-	if err := loadActiveLease(ctx, tx, parent, fencingToken); err != nil {
+	if err := loadOwnedActiveLease(ctx, tx, parent, fencingToken, actor.ID, now); err != nil {
 		return "", err
 	}
 	if parent.State != mission.StateRunning {
 		return "", store.ErrConflict // 只有 RUNNING 中的 Lead 能 delegate（§15.1 时序约束）
 	}
-	child.State = mission.StatePending
+	if !mission.PermissionEnvelopeSubset(parent.Grants, child.Grants) {
+		return "", store.ErrPermissionExceeded
+	}
+	var total, held, spent int64
+	budgetErr := tx.QueryRow(ctx,
+		`SELECT total_tokens, held_tokens, spent_tokens FROM mission_budgets
+		 WHERE mission_id=$1 FOR UPDATE`, child.MissionID).Scan(&total, &held, &spent)
+	metered := budgetErr == nil
+	if budgetErr != nil && !errors.Is(budgetErr, pgx.ErrNoRows) {
+		return "", budgetErr
+	}
+	if metered {
+		amount := child.Scheduling.BudgetTokens
+		if amount <= 0 {
+			return "", store.ErrBudgetRequired
+		}
+		if total-held-spent < amount {
+			return "", store.ErrBudgetExceeded
+		}
+	}
+	child.State = mission.StateReady
+	child.Version = 1
 	spec := marshalSpec(child)
 	scheduling, _ := js(child.Scheduling)
 	retry, _ := js(child.Retry)
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO subtasks (id, mission_id, parent_id, kind, spec, scheduling, retry, state,
 		 depends_on, attempt, version, created_at, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'{}',0,0,$9,$9)`,
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'{}',0,1,$9,$9)`,
 		child.ID, child.MissionID, parentID, string(child.Kind), spec, scheduling, retry,
 		string(child.State), now); err != nil {
 		return "", store.ErrConflict // 子女 ID 冲突
@@ -795,6 +1157,29 @@ func (s *Store) SpawnSubtask(ctx context.Context, idemKey, parentID string, fenc
 		idemKey, child.ID, now); err != nil {
 		return "", err
 	}
+	if metered {
+		amount := child.Scheduling.BudgetTokens
+		holdID := store.BudgetHoldID(child.ID)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO budget_holds
+			 (id, mission_id, subtask_id, attempt, amount_tokens, actual_tokens, status, created_at)
+			 VALUES ($1,$2,$3,$4,$5,0,$6,$7)`, holdID, child.MissionID, child.ID,
+			child.Attempt, amount, store.BudgetHoldHeld, now); err != nil {
+			return "", err
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE mission_budgets SET held_tokens=held_tokens+$2, version=version+1, updated_at=$3
+			 WHERE mission_id=$1`, child.MissionID, amount, now); err != nil {
+			return "", err
+		}
+		if err := appendEvent(ctx, tx, &store.Event{AggregateID: child.ID, MissionID: child.MissionID,
+			Type: "budget.held", Payload: map[string]any{
+				"hold_id": holdID, "amount_tokens": amount,
+				"available_tokens": total - held - spent - amount,
+			}, Actor: actor, Ts: now}); err != nil {
+			return "", err
+		}
+	}
 	ev := &store.Event{AggregateID: child.ID, MissionID: child.MissionID, Type: string(mission.EvCreated),
 		Payload: map[string]any{
 			"kind":              string(child.Kind),
@@ -802,6 +1187,11 @@ func (s *Store) SpawnSubtask(ctx context.Context, idemKey, parentID string, fenc
 			"rework_of":         child.ReworkOf,
 		}, Actor: actor, Ts: now}
 	if err := appendEvent(ctx, tx, ev); err != nil {
+		return "", err
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: child.ID, MissionID: child.MissionID,
+		Type: string(mission.EvDepsSatisfied), Payload: map[string]any{"state": string(mission.StateReady)},
+		Actor: store.Actor{Kind: "system", ID: "orchestrator"}, Ts: now}); err != nil {
 		return "", err
 	}
 	return "", tx.Commit(ctx)
@@ -815,23 +1205,323 @@ func (s *Store) CountChildren(ctx context.Context, parentID string) (int, error)
 	return n, err
 }
 
-func (s *Store) FailSubtask(ctx context.Context, id string, fencingToken int64, reason string,
-	expectedVersion int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
-	sub, err := s.fencedTransition(ctx, id, fencingToken, expectedVersion, mission.EvFailed,
-		map[string]any{"reason": reason}, actor, now, nil)
+func scanLeadInbox(row pgx.Row) (*store.LeadInboxItem, error) {
+	var item store.LeadInboxItem
+	var ingestedBy *string
+	err := row.Scan(&item.ID, &item.MissionID, &item.LeadSubtaskID, &item.SourceSubtaskID,
+		&item.Kind, &item.ResultRef, &item.Status, &item.IngestMode, &ingestedBy,
+		&item.Version, &item.CreatedAt, &item.IngestedAt)
+	if ingestedBy != nil {
+		item.IngestedBy = *ingestedBy
+	}
+	return &item, err
+}
+
+const leadInboxCols = `id, mission_id, lead_subtask_id, source_subtask_id, kind, result_ref,
+	status, ingest_mode, ingested_by, version, created_at, ingested_at`
+
+func (s *Store) ListLeadInbox(ctx context.Context, leadSubtaskID string, pendingOnly bool) ([]*store.LeadInboxItem, error) {
+	q := `SELECT ` + leadInboxCols + ` FROM lead_inbox WHERE lead_subtask_id=$1`
+	if pendingOnly {
+		q += ` AND status='pending'`
+	}
+	q += ` ORDER BY created_at, id`
+	rows, err := s.pool.Query(ctx, q, leadSubtaskID)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE leases SET state='RELEASED' WHERE id=$1`, sub.LeaseID); err != nil {
+	defer rows.Close()
+	var out []*store.LeadInboxItem
+	for rows.Next() {
+		item, err := scanLeadInbox(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) IngestLeadInbox(ctx context.Context, itemID, leadSubtaskID string,
+	fencingToken, expectedVersion int64, mode string, actor store.Actor, now time.Time) (*store.LeadInboxItem, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return sub, nil
+	defer tx.Rollback(ctx)
+	item, err := scanLeadInbox(tx.QueryRow(ctx,
+		`SELECT `+leadInboxCols+` FROM lead_inbox WHERE id=$1 FOR UPDATE`, itemID))
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && item.LeadSubtaskID != leadSubtaskID {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	lead, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, leadSubtaskID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lead.State != mission.StateRunning {
+		return nil, store.ErrConflict
+	}
+	if err := loadOwnedActiveLease(ctx, tx, lead, fencingToken, actor.ID, now); err != nil {
+		return nil, err
+	}
+	if item.Status != store.LeadInboxPending || item.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE lead_inbox SET status=$1, ingest_mode=$2, ingested_by=$3, ingested_at=$4,
+		 version=version+1 WHERE id=$5 AND status='pending' AND version=$6`,
+		store.LeadInboxIngested, mode, actor.ID, now, item.ID, expectedVersion)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, store.ErrConflict
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: lead.ID, MissionID: lead.MissionID,
+		Type: "lead.inbox.ingested", Payload: map[string]any{
+			"item_id": item.ID, "source_subtask_id": item.SourceSubtaskID, "mode": mode,
+		}, Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	item.Status, item.IngestMode, item.IngestedBy = store.LeadInboxIngested, mode, actor.ID
+	item.IngestedAt = &now
+	item.Version++
+	return item, tx.Commit(ctx)
+}
+
+func (s *Store) SaveLeadSnapshot(ctx context.Context, leadSubtaskID string,
+	fencingToken, expectedVersion int64, value []byte, leaseTTL time.Duration,
+	actor store.Actor, now time.Time) (*store.BoardEntry, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	lead, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, leadSubtaskID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lead.State != mission.StateRunning {
+		return nil, store.ErrConflict
+	}
+	if err := loadOwnedActiveLease(ctx, tx, lead, fencingToken, actor.ID, now); err != nil {
+		return nil, err
+	}
+	val, err := js(json.RawMessage(value))
+	if err != nil {
+		return nil, err
+	}
+	entry := &store.BoardEntry{MissionID: lead.MissionID, Namespace: "lead-plan", Key: lead.ID,
+		Value: append([]byte(nil), value...), UpdatedAt: now}
+	if expectedVersion == -1 {
+		err = tx.QueryRow(ctx,
+			`INSERT INTO board_entries (mission_id, namespace, key, value, version, updated_at)
+			 VALUES ($1,'lead-plan',$2,$3,0,$4)
+			 ON CONFLICT (mission_id, namespace, key) DO NOTHING RETURNING version`,
+			lead.MissionID, lead.ID, val, now).Scan(&entry.Version)
+	} else {
+		err = tx.QueryRow(ctx,
+			`UPDATE board_entries SET value=$1, version=version+1, updated_at=$2
+			 WHERE mission_id=$3 AND namespace='lead-plan' AND key=$4 AND version=$5
+			 RETURNING version`, val, now, lead.MissionID, lead.ID, expectedVersion).Scan(&entry.Version)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrConflict
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE leases SET expires_at=$1 WHERE id=$2`,
+		now.Add(leaseTTL), lead.LeaseID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE agents SET health=jsonb_set(
+		   jsonb_set(health,'{last_heartbeat}',to_jsonb($2::text)),
+		   '{status}',to_jsonb(CASE WHEN health->>'status'='suspect' THEN 'healthy'
+		                           ELSE health->>'status' END)),
+		 updated_at=$2 WHERE id=$1`, actor.ID, now); err != nil {
+		return nil, err
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: lead.ID, MissionID: lead.MissionID,
+		Type: "lead.snapshot.saved", Payload: map[string]any{"version": entry.Version},
+		Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	return entry, tx.Commit(ctx)
+}
+
+func (s *Store) TakeoverStaleLeads(ctx context.Context, now time.Time) ([]*mission.Subtask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx,
+		`SELECT s.id FROM subtasks s JOIN leases l ON l.id=s.lease_id
+		 WHERE s.state='RUNNING' AND l.state='ACTIVE' AND l.expires_at<=$1
+		 AND (EXISTS (SELECT 1 FROM subtasks c WHERE c.parent_id=s.id)
+		      OR EXISTS (SELECT 1 FROM board_entries b
+		                 WHERE b.mission_id=s.mission_id AND b.namespace='lead-plan' AND b.key=s.id))
+		 ORDER BY s.id FOR UPDATE OF s, l`, now)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	var out []*mission.Subtask
+	for _, id := range ids {
+		lead, err := scanSubtask(tx.QueryRow(ctx,
+			`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1`, id))
+		if err != nil {
+			return nil, err
+		}
+		if _, err := mission.Apply(lead.State, mission.EvTakeover); err != nil {
+			return nil, store.ErrConflict
+		}
+		oldAgent, oldLease := lead.Assignee, lead.LeaseID
+		if _, err := tx.Exec(ctx, `UPDATE leases SET state='FENCED' WHERE id=$1 AND state='ACTIVE'`, oldLease); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE agents SET health=jsonb_set(health,'{status}',to_jsonb(
+			 CASE WHEN health->>'status'='down' THEN 'down' ELSE 'suspect' END)),
+			 updated_at=$1 WHERE id=$2`, now, oldAgent); err != nil {
+			return nil, err
+		}
+		lead.State, lead.Assignee, lead.LeaseID = mission.StateReady, "", ""
+		if err := updateSubtask(ctx, tx, lead, lead.Version, now); err != nil {
+			return nil, err
+		}
+		if err := appendEvent(ctx, tx, &store.Event{AggregateID: lead.ID, MissionID: lead.MissionID,
+			Type: string(mission.EvTakeover), Payload: map[string]any{
+				"state": string(mission.StateReady), "fenced_lease_id": oldLease, "previous_agent_id": oldAgent,
+			}, Actor: store.Actor{Kind: "system", ID: "lead-takeover"}, Ts: now}); err != nil {
+			return nil, err
+		}
+		lead.Version++
+		out = append(out, lead)
+	}
+	return out, tx.Commit(ctx)
+}
+
+func (s *Store) FailSubtask(ctx context.Context, id string, fencingToken int64, reason string,
+	expectedVersion int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	sub, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sub.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	if err := loadActiveLease(ctx, tx, sub, fencingToken); err != nil {
+		return nil, err
+	}
+	if _, err := mission.Apply(sub.State, mission.EvFailed); err != nil {
+		return nil, store.ErrConflict
+	}
+	leaseID := sub.LeaseID
+	sub.State = mission.StateFailed
+	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
+		return nil, err
+	}
+	if err := releaseLease(ctx, tx, leaseID); err != nil {
+		return nil, err
+	}
+	if sub.Attempt >= sub.Retry.MaxAttempts {
+		if err := releaseBudgetHold(ctx, tx, sub, "final_failure", actor, now); err != nil {
+			return nil, err
+		}
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+		Type: string(mission.EvFailed), Payload: map[string]any{
+			"state": string(mission.StateFailed), "reason": reason}, Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	sub.Version++
+	return sub, tx.Commit(ctx)
 }
 
 func (s *Store) BlockSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
 	actor store.Actor, now time.Time) (*mission.Subtask, error) {
 	return s.fencedTransition(ctx, id, fencingToken, expectedVersion, mission.EvBlocked,
 		map[string]any{}, actor, now, nil)
+}
+
+func (s *Store) CancelSubtask(ctx context.Context, id string, expectedVersion int64,
+	actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	sub, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sub.Version != expectedVersion {
+		return nil, store.ErrConflict
+	}
+	if _, err := mission.Apply(sub.State, mission.EvCancelled); err != nil {
+		return nil, store.ErrConflict
+	}
+	leaseID := sub.LeaseID
+	sub.State = mission.StateCancelled
+	sub.Assignee, sub.LeaseID = "", ""
+	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
+		return nil, err
+	}
+	if leaseID != "" {
+		if err := releaseLease(ctx, tx, leaseID); err != nil {
+			return nil, err
+		}
+	}
+	if err := releaseBudgetHold(ctx, tx, sub, "cancelled", actor, now); err != nil {
+		return nil, err
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+		Type: string(mission.EvCancelled), Payload: map[string]any{"state": string(mission.StateCancelled)},
+		Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	sub.Version++
+	return sub, tx.Commit(ctx)
 }
 
 // ---- 挂起-唤醒（M3） ----
@@ -881,9 +1571,9 @@ func (s *Store) SuspendSubtask(ctx context.Context, id string, fencingToken int6
 		return nil, err
 	}
 	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
-		Type: string(mission.EvSuspended),
+		Type:    string(mission.EvSuspended),
 		Payload: map[string]any{"state": string(mission.StateWaiting), "wake_kind": wake.Kind},
-		Actor: actor, Ts: now}); err != nil {
+		Actor:   actor, Ts: now}); err != nil {
 		return nil, err
 	}
 	sub.Version++
@@ -908,6 +1598,9 @@ func (s *Store) WakeSubtask(ctx context.Context, id string, expectedVersion int6
 	}
 	if sub.Version != expectedVersion {
 		return nil, store.ErrConflict // CAS 竞争：另一 sweeper/wake 已处理
+	}
+	if sub.WakeDeadline != nil && !sub.WakeDeadline.After(now) {
+		return nil, store.ErrConflict
 	}
 	if _, err := mission.Apply(sub.State, mission.EvWoken); err != nil {
 		return nil, store.ErrConflict
@@ -979,9 +1672,9 @@ func (s *Store) ExpireWakes(ctx context.Context, now time.Time) ([]*mission.Subt
 		}
 		sub.Version++
 		if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
-			Type: string(mission.EvFailed),
+			Type:    string(mission.EvFailed),
 			Payload: map[string]any{"state": string(mission.StateFailed), "reason": "wake_timeout"},
-			Actor: store.Actor{Kind: "system", ID: "sweeper"}, Ts: now}); err != nil {
+			Actor:   store.Actor{Kind: "system", ID: "sweeper"}, Ts: now}); err != nil {
 			return nil, err
 		}
 	}
@@ -1055,7 +1748,7 @@ func (s *Store) PutIdempotent(ctx context.Context, key, result string, now time.
 	return "", err
 }
 
-func (s *Store) getSubtask(ctx context.Context, id string) (*mission.Subtask, error) {
+func (s *Store) GetSubtask(ctx context.Context, id string) (*mission.Subtask, error) {
 	sub, err := scanSubtask(s.pool.QueryRow(ctx,
 		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1113,6 +1806,62 @@ func (s *Store) CreateDecision(ctx context.Context, d *store.Decision, now time.
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Store) CreateDecisionAndBlock(ctx context.Context, d *store.Decision, expectedSubVersion int64,
+	fencingToken *int64, actor store.Actor, now time.Time) (*mission.Subtask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	sub, err := scanSubtask(tx.QueryRow(ctx,
+		`SELECT `+subtaskCols+` FROM subtasks WHERE id=$1 FOR UPDATE`, d.SubtaskID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sub.Version != expectedSubVersion {
+		return nil, store.ErrConflict
+	}
+	if fencingToken != nil {
+		if err := loadActiveLease(ctx, tx, sub, *fencingToken); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := mission.Apply(sub.State, mission.EvBlocked); err != nil {
+		return nil, store.ErrConflict
+	}
+	sub.State = mission.StateBlocked
+	if err := updateSubtask(ctx, tx, sub, expectedSubVersion, now); err != nil {
+		return nil, err
+	}
+	options, err := js(d.Options)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO decisions (id, mission_id, subtask_id, kind, question, options, status,
+		 decider_type, decider_id, deadline, on_timeout, ts)
+		 VALUES ($1,$2,$3,$4,$5,$6,'pending','human',NULL,$7,$8,$9)`,
+		d.ID, d.MissionID, d.SubtaskID, d.Kind, d.Question, options, d.Deadline, d.OnTimeout, now); err != nil {
+		return nil, store.ErrConflict
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
+		Type: string(mission.EvBlocked), Payload: map[string]any{
+			"state": string(mission.StateBlocked), "question": d.Question}, Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: d.SubtaskID, MissionID: d.MissionID,
+		Type: "decision.requested", Payload: map[string]any{
+			"decision_id": d.ID, "question": d.Question, "options": d.Options}, Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	d.Status, d.CreatedAt = store.DecisionPending, now
+	sub.Version++
+	return sub, tx.Commit(ctx)
 }
 
 func (s *Store) GetDecision(ctx context.Context, id string) (*store.Decision, error) {
@@ -1243,24 +1992,7 @@ func (s *Store) BoardPut(ctx context.Context, e *store.BoardEntry, expectedVersi
 			return nil, err
 		}
 		if tag.RowsAffected() == 0 {
-			if expectedVersion == -1 {
-				// 约定 -1 表示"应不存在"，此处不会到达（>=0 分支）
-			}
-			// 可能是新建（expectedVersion 0 且不存在）：尝试插入
-			if _, ierr := s.pool.Exec(ctx,
-				`INSERT INTO board_entries (mission_id, namespace, key, value, version, updated_at)
-				 VALUES ($1,$2,$3,$4,0,$5) ON CONFLICT DO NOTHING`,
-				e.MissionID, e.Namespace, e.Key, val, now); ierr != nil {
-				return nil, ierr
-			}
-			cur, gerr := s.BoardGet(ctx, e.MissionID, e.Namespace, e.Key)
-			if gerr != nil {
-				return nil, gerr
-			}
-			if cur.Version != expectedVersion && !(expectedVersion == 0 && cur.Version == 0) {
-				return nil, store.ErrConflict
-			}
-			return cur, nil
+			return nil, store.ErrConflict
 		}
 		return s.BoardGet(ctx, e.MissionID, e.Namespace, e.Key)
 	}

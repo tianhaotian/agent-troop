@@ -18,9 +18,10 @@ import (
 
 // Config 服务参数。
 type Config struct {
-	OfferTTL       time.Duration // OFFERED 租约寿命（Agent 须在此时间内 accept）
-	ScheduleBatch  int           // 单轮调度拉取的就绪任务数
-	HeartbeatStale time.Duration // 超过该时长无心跳标记 suspect
+	OfferTTL         time.Duration // OFFERED 租约寿命（Agent 须在此时间内 accept）
+	ScheduleBatch    int           // 单轮调度拉取的就绪任务数
+	HeartbeatStale   time.Duration // 超过该时长无心跳标记 suspect
+	LeadHeartbeatTTL time.Duration // Lead snapshot heartbeat 续租窗口（§15.2）
 	// 主子委托（M6，§15.1 结构校验）
 	MaxDelegateDepth  int // 委托链最大深度（沿 parent_id 上溯）
 	MaxDelegateFanout int // 单父任务最大直接子女数
@@ -29,6 +30,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{OfferTTL: 30 * time.Second, ScheduleBatch: 100, HeartbeatStale: 90 * time.Second,
+		LeadHeartbeatTTL: 60 * time.Second,
 		MaxDelegateDepth: 4, MaxDelegateFanout: 8, MaxRework: 3}
 }
 
@@ -44,6 +46,9 @@ func New(st store.Store, clk clock.Clock, cfg Config) *Service {
 	return &Service{st: st, clk: clk, cfg: cfg, blob: NewMemBlob(), strategy: CapabilityFirst{}}
 }
 
+// Ready 验证服务处理流量所需的存储依赖可用。
+func (s *Service) Ready(ctx context.Context) error { return s.st.Ping(ctx) }
+
 // WithStrategy 替换放置策略（M3-T1；cmd/troopd 由 TROOP_SCHEDULER 解析）。
 func (s *Service) WithStrategy(ps PlacementStrategy) *Service {
 	s.strategy = ps
@@ -51,8 +56,10 @@ func (s *Service) WithStrategy(ps PlacementStrategy) *Service {
 }
 
 var (
-	ErrInvalidDAG = errors.New("core: invalid DAG")
-	ErrNoAgent    = errors.New("core: no eligible agent")
+	ErrInvalidDAG        = errors.New("core: invalid DAG")
+	ErrInvalidBudget     = errors.New("core: invalid budget")
+	ErrInvalidPermission = errors.New("core: invalid permission envelope")
+	ErrNoAgent           = errors.New("core: no eligible agent")
 )
 
 // ---- ID 生成（crypto/rand，非业务决策，不受 ADR-8 确定性约束） ----
@@ -67,18 +74,19 @@ func newID(prefix string) string {
 
 // TaskSpec 提交 Mission 时的子任务声明（M1：DAG 由调用方完整给出，即 Workflow 模式）。
 type TaskSpec struct {
-	Name           string            `json:"name"` // Mission 内唯一节点名
-	Kind           mission.Kind      `json:"kind"`
-	RequiredSkills []string          `json:"required_skills,omitempty"`
-	DependsOn      []string          `json:"depends_on,omitempty"` // 其他节点的 name
-	Input          map[string]any    `json:"input,omitempty"`
-	Priority       int               `json:"priority,omitempty"`
-	Deadline       *time.Time        `json:"deadline,omitempty"`
-	MaxAttempts    int               `json:"max_attempts,omitempty"` // 0 = 不重试
+	Name           string                     `json:"name"` // Mission 内唯一节点名
+	Kind           mission.Kind               `json:"kind"`
+	RequiredSkills []string                   `json:"required_skills,omitempty"`
+	DependsOn      []string                   `json:"depends_on,omitempty"` // 其他节点的 name
+	Input          map[string]any             `json:"input,omitempty"`
+	Priority       int                        `json:"priority,omitempty"`
+	Deadline       *time.Time                 `json:"deadline,omitempty"`
+	MaxAttempts    int                        `json:"max_attempts,omitempty"` // 0 = 不重试
+	Grants         mission.PermissionEnvelope `json:"grants,omitempty"`
 	// human 节点（M2）：工单内容与超时策略
-	Question       string            `json:"question,omitempty"`
-	Options        []string          `json:"options,omitempty"`
-	OnTimeout      string            `json:"on_timeout,omitempty"` // auto_approve | auto_reject
+	Question  string   `json:"question,omitempty"`
+	Options   []string `json:"options,omitempty"`
+	OnTimeout string   `json:"on_timeout,omitempty"` // auto_approve | auto_reject
 }
 
 // validateDAG 校验：节点名唯一、依赖存在、无环（Kahn 拓扑）。
@@ -86,6 +94,9 @@ func validateDAG(tasks []TaskSpec) error {
 	seen := map[string]bool{}
 	indegree := map[string]int{}
 	for _, t := range tasks {
+		if _, err := mission.NormalizePermissionEnvelope(t.Grants); err != nil {
+			return fmt.Errorf("%w: task %q: %v", ErrInvalidPermission, t.Name, err)
+		}
 		if t.Name == "" || seen[t.Name] {
 			return fmt.Errorf("%w: duplicate or empty node name %q", ErrInvalidDAG, t.Name)
 		}
@@ -133,20 +144,32 @@ func validateDAG(tasks []TaskSpec) error {
 
 // CreateMission 落库（全部 PENDING）后把根节点推进 READY。
 func (s *Service) CreateMission(ctx context.Context, owner, goal string, tasks []TaskSpec) (*mission.Mission, error) {
-	return s.createMission(ctx, newID("msn"), store.Actor{Kind: "human", ID: owner}, owner, goal, tasks)
+	return s.CreateMissionWithBudget(ctx, owner, goal, 0, tasks)
+}
+
+// CreateMissionWithBudget 创建可选 token 硬顶账户；budgetTokens=0 保持历史 unmetered 语义。
+func (s *Service) CreateMissionWithBudget(ctx context.Context, owner, goal string, budgetTokens int64,
+	tasks []TaskSpec) (*mission.Mission, error) {
+	return s.createMission(ctx, newID("msn"), store.Actor{Kind: "human", ID: owner},
+		owner, goal, budgetTokens, tasks)
 }
 
 // createMission 带预定 ID 与触发者的创建（M4 准入管道：幂等占位需先定 ID，
 // actor 为 intent source，落创建事件留痕）。
-func (s *Service) createMission(ctx context.Context, id string, actor store.Actor, owner, goal string, tasks []TaskSpec) (*mission.Mission, error) {
+func (s *Service) createMission(ctx context.Context, id string, actor store.Actor, owner, goal string,
+	budgetTokens int64, tasks []TaskSpec) (*mission.Mission, error) {
+	if budgetTokens < 0 {
+		return nil, fmt.Errorf("%w: budget_tokens must be >= 0", ErrInvalidBudget)
+	}
 	if err := validateDAG(tasks); err != nil {
 		return nil, err
 	}
 	now := s.clk.Now()
-	m := &mission.Mission{ID: id, Owner: owner, Goal: goal, Status: mission.MissionActive}
+	m := &mission.Mission{ID: id, Owner: owner, Goal: goal, BudgetTokens: budgetTokens, Status: mission.MissionActive}
 
 	subs := make([]*mission.Subtask, len(tasks))
 	for i, t := range tasks {
+		grants, _ := mission.NormalizePermissionEnvelope(t.Grants)
 		depends := make([]string, len(t.DependsOn))
 		for j, d := range t.DependsOn {
 			depends[j] = subID(m.ID, d)
@@ -160,6 +183,8 @@ func (s *Service) createMission(ctx context.Context, id string, actor store.Acto
 			Scheduling:     mission.SchedulingSpec{Priority: t.Priority, Deadline: t.Deadline},
 			Retry:          mission.RetryPolicy{MaxAttempts: t.MaxAttempts, OnFailure: "retry"},
 			State:          mission.StatePending,
+			Input:          t.Input,
+			Grants:         grants,
 			Question:       t.Question,
 			Options:        t.Options,
 			OnTimeout:      t.OnTimeout,
@@ -168,15 +193,27 @@ func (s *Service) createMission(ctx context.Context, id string, actor store.Acto
 	if err := s.st.CreateMission(ctx, m, subs, actor, now); err != nil {
 		return nil, err
 	}
-	// 根节点（无依赖）推进 READY
-	for _, sub := range subs {
-		if len(sub.DependsOn) == 0 {
-			if _, err := s.st.TransitionSubtask(ctx, sub.ID, mission.EvDepsSatisfied, 0, actor, nil, now, nil); err != nil {
-				return nil, fmt.Errorf("activate root %s: %w", sub.ID, err)
-			}
-		}
+	if err := s.activateMissionRoots(ctx, m.ID, actor); err != nil {
+		return nil, err
 	}
 	return m, nil
+}
+
+func (s *Service) activateMissionRoots(ctx context.Context, missionID string, actor store.Actor) error {
+	subs, err := s.st.ListSubtasks(ctx, missionID)
+	if err != nil {
+		return err
+	}
+	for _, sub := range subs {
+		if sub.State != mission.StatePending || len(sub.DependsOn) != 0 {
+			continue
+		}
+		if _, err := s.st.TransitionSubtask(ctx, sub.ID, mission.EvDepsSatisfied, sub.Version,
+			actor, nil, s.clk.Now(), nil); err != nil && !errors.Is(err, store.ErrConflict) {
+			return fmt.Errorf("activate root %s: %w", sub.ID, err)
+		}
+	}
+	return nil
 }
 
 func subID(missionID, name string) string { return "sub_" + missionID[4:] + "_" + name }
@@ -184,6 +221,17 @@ func subID(missionID, name string) string { return "sub_" + missionID[4:] + "_" 
 // GetMission / ListSubtasks / ListMissionEvents / ListAgents 查询直通。
 func (s *Service) GetMission(ctx context.Context, id string) (*mission.Mission, error) {
 	return s.st.GetMission(ctx, id)
+}
+func (s *Service) GetMissionBudget(ctx context.Context, id string) (*store.BudgetAccount, []*store.BudgetHold, error) {
+	account, err := s.st.GetMissionBudget(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	holds, err := s.st.ListBudgetHolds(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return account, holds, nil
 }
 func (s *Service) ListSubtasks(ctx context.Context, missionID string) ([]*mission.Subtask, error) {
 	return s.st.ListSubtasks(ctx, missionID)
@@ -207,9 +255,9 @@ func (s *Service) CancelMission(ctx context.Context, id, owner string) error {
 		if sub.State.Terminal() {
 			continue
 		}
-		// 冲突忽略：并发下状态已变化则跳过（尽力而为级联）
-		_, _ = s.st.TransitionSubtask(ctx, sub.ID, mission.EvCancelled, sub.Version, actor,
-			map[string]any{"reason": "mission cancelled"}, now, nil)
+		if _, err := s.st.CancelSubtask(ctx, sub.ID, sub.Version, actor, now); err != nil {
+			return err
+		}
 	}
 	m, err := s.st.GetMission(ctx, id)
 	if err != nil {
@@ -340,6 +388,10 @@ func (s *Service) GetLease(ctx context.Context, id string) (*store.Lease, error)
 	return s.st.GetLease(ctx, id)
 }
 
+func (s *Service) GetContextPackage(ctx context.Context, leaseID string) (*store.ContextPackage, error) {
+	return s.st.GetContextPackage(ctx, leaseID)
+}
+
 // ListOffers 返回派给某 Agent 的待确认租约任务（Adapter 轮询拉取，M1 拉模式）。
 func (s *Service) ListOffers(ctx context.Context, agentID string) ([]*mission.Subtask, error) {
 	offered, err := s.st.ListSubtasksByState(ctx, mission.StateOffered)
@@ -357,12 +409,56 @@ func (s *Service) ListOffers(ctx context.Context, agentID string) ([]*mission.Su
 
 // ---- 执行回调（fencing 校验在 store 层原子完成） ----
 
+// authorizeLeaseOwner 将协议中的 agent_id 与持久化租约绑定。Store 仍负责在事务内
+// 重验 fencing；这里封闭客户端冒用其他 Agent 身份写入审计事件的入口。
+func (s *Service) authorizeLeaseOwner(ctx context.Context, leaseID, subtaskID string,
+	fencingToken int64, agentID string, requireActive bool) (*store.Lease, error) {
+	if agentID == "" {
+		return nil, fmt.Errorf("%w: agent_id required", ErrForbidden)
+	}
+	lease, err := s.st.GetLease(ctx, leaseID)
+	if err != nil {
+		return nil, err
+	}
+	if lease.AgentID != agentID {
+		return nil, fmt.Errorf("%w: agent %q does not own lease %q", ErrForbidden, agentID, leaseID)
+	}
+	if subtaskID != "" && lease.SubtaskID != subtaskID {
+		return nil, fmt.Errorf("%w: lease %q does not belong to subtask %q", ErrForbidden, leaseID, subtaskID)
+	}
+	if lease.FencingToken != fencingToken || requireActive && lease.State != store.LeaseActive {
+		return nil, store.ErrFenced
+	}
+	return lease, nil
+}
+
+func (s *Service) authorizeSubtaskLeaseOwner(ctx context.Context, subtaskID string,
+	fencingToken int64, agentID string, requireActive bool) (*mission.Subtask, error) {
+	sub, err := s.st.GetSubtask(ctx, subtaskID)
+	if err != nil {
+		return nil, err
+	}
+	if sub.LeaseID == "" {
+		return nil, store.ErrFenced
+	}
+	if _, err := s.authorizeLeaseOwner(ctx, sub.LeaseID, subtaskID, fencingToken, agentID, requireActive); err != nil {
+		return nil, err
+	}
+	return sub, nil
+}
+
 func (s *Service) AcceptLease(ctx context.Context, leaseID string, fencingToken int64, subtaskVersion int64, agentID string) (*mission.Subtask, error) {
+	if _, err := s.authorizeLeaseOwner(ctx, leaseID, "", fencingToken, agentID, true); err != nil {
+		return nil, err
+	}
 	return s.st.AcceptLease(ctx, leaseID, fencingToken, subtaskVersion,
 		store.Actor{Kind: "agent", ID: agentID}, s.clk.Now())
 }
 
 func (s *Service) StartSubtask(ctx context.Context, subtaskID string, fencingToken int64, version int64, agentID string) (*mission.Subtask, error) {
+	if _, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, true); err != nil {
+		return nil, err
+	}
 	return s.st.StartSubtask(ctx, subtaskID, fencingToken, version,
 		store.Actor{Kind: "agent", ID: agentID}, s.clk.Now())
 }
@@ -374,8 +470,29 @@ func (s *Service) RenewLease(ctx context.Context, leaseID string, fencingToken i
 
 // CompleteSubtask 完成回调：幂等/fencing 在 store 层；成功后传播依赖与终态。
 func (s *Service) CompleteSubtask(ctx context.Context, subtaskID string, fencingToken int64, idemKey, resultRef string, version int64, agentID string) (*mission.Subtask, error) {
+	return s.CompleteSubtaskWithUsage(ctx, subtaskID, fencingToken, idemKey, resultRef, 0, version, agentID)
+}
+
+// CompleteSubtaskWithUsage 将任务完成和 delegated budget hold 结算为一个原子存储操作。
+func (s *Service) CompleteSubtaskWithUsage(ctx context.Context, subtaskID string, fencingToken int64,
+	idemKey, resultRef string, usageTokens, version int64, agentID string) (*mission.Subtask, error) {
+	if usageTokens < 0 {
+		return nil, fmt.Errorf("%w: usage_tokens must be >= 0", ErrInvalidBudget)
+	}
+	// 幂等重放发生时租约已 RELEASED，因此只校验不可变的 owner/subtask/token 绑定；
+	// Store 继续以“幂等键优先”决定是重放还是要求 ACTIVE 租约。
+	if _, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, false); err != nil {
+		return nil, err
+	}
 	actor := store.Actor{Kind: "agent", ID: agentID}
-	sub, err := s.st.CompleteSubtask(ctx, subtaskID, fencingToken, idemKey, resultRef, version, actor, s.clk.Now())
+	sub, err := s.st.CompleteSubtaskWithUsage(ctx, subtaskID, fencingToken, idemKey, resultRef,
+		usageTokens, version, actor, s.clk.Now())
+	if errors.Is(err, store.ErrDuplicate) && sub != nil && sub.State == mission.StateSucceeded {
+		if propErr := s.propagate(ctx, sub, actor); propErr != nil {
+			return sub, fmt.Errorf("reconcile duplicate completion: %w", propErr)
+		}
+		return sub, store.ErrDuplicate
+	}
 	if err != nil {
 		return sub, err
 	}
@@ -387,6 +504,9 @@ func (s *Service) CompleteSubtask(ctx context.Context, subtaskID string, fencing
 
 // FailSubtask 失败回调：按 retry 策略重试回 READY，否则推导 Mission 终态。
 func (s *Service) FailSubtask(ctx context.Context, subtaskID string, fencingToken int64, reason string, version int64, agentID string) (*mission.Subtask, error) {
+	if _, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, true); err != nil {
+		return nil, err
+	}
 	actor := store.Actor{Kind: "agent", ID: agentID}
 	now := s.clk.Now()
 	sub, err := s.st.FailSubtask(ctx, subtaskID, fencingToken, reason, version, actor, now)
@@ -402,9 +522,10 @@ func (s *Service) FailSubtask(ctx context.Context, subtaskID string, fencingToke
 				st.Assignee, st.LeaseID = "", ""
 				return nil
 			})
-		if err == nil {
-			return retried, nil
+		if err != nil {
+			return sub, fmt.Errorf("retry failed subtask: %w", err)
 		}
+		return retried, nil
 	}
 	// 永久失败：级联取消不可达下游，再推导 Mission 终态
 	if err := s.cancelUnreachable(ctx, sub, actor); err != nil {
@@ -446,6 +567,9 @@ func (s *Service) BoardList(ctx context.Context, missionID, ns string) ([]*store
 // SweepOnce 回收到期租约、标记心跳过期 Agent、处理到期决策工单（M2-H6）。
 func (s *Service) SweepOnce(ctx context.Context) error {
 	now := s.clk.Now()
+	if _, err := s.st.TakeoverStaleLeads(ctx, now); err != nil {
+		return err
+	}
 	if _, err := s.st.ExpireLeases(ctx, now); err != nil {
 		return err
 	}
@@ -474,5 +598,63 @@ func (s *Service) SweepOnce(ctx context.Context) error {
 		// status==expired（无 on_timeout 动作）：保持 BLOCKED 等人工干预（M2 边界）
 	}
 	// M3：挂起任务的 timer 唤醒与 wake TTL 回收
-	return s.sweepWakes(ctx)
+	if err := s.sweepWakes(ctx); err != nil {
+		return err
+	}
+	if err := s.reconcilePendingRoots(ctx); err != nil {
+		return err
+	}
+	if err := s.reconcileSucceeded(ctx); err != nil {
+		return err
+	}
+	return s.reconcileResolvedDecisions(ctx)
+}
+
+// reconcilePendingRoots 修复旧版本或异常中断遗留的无依赖 PENDING 根节点。
+func (s *Service) reconcilePendingRoots(ctx context.Context) error {
+	pending, err := s.st.ListSubtasksByState(ctx, mission.StatePending)
+	if err != nil {
+		return err
+	}
+	for _, sub := range pending {
+		if len(sub.DependsOn) != 0 {
+			continue
+		}
+		if _, err := s.st.TransitionSubtask(ctx, sub.ID, mission.EvDepsSatisfied, sub.Version,
+			store.Actor{Kind: "system", ID: "reconciler"}, nil, s.clk.Now(), nil); err != nil &&
+			!errors.Is(err, store.ErrConflict) {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileSucceeded 重放幂等的依赖传播，修复完成提交后进程中断造成的派生状态缺失。
+func (s *Service) reconcileSucceeded(ctx context.Context) error {
+	done, err := s.st.ListSubtasksByState(ctx, mission.StateSucceeded)
+	if err != nil {
+		return err
+	}
+	for _, sub := range done {
+		if err := s.propagate(ctx, sub, store.Actor{Kind: "system", ID: "reconciler"}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileResolvedDecisions 重放已落库裁决的状态效果；applyDecisionOutcome 对已处理任务幂等。
+func (s *Service) reconcileResolvedDecisions(ctx context.Context) error {
+	decisions, err := s.st.ListDecisions(ctx, "", false)
+	if err != nil {
+		return err
+	}
+	for _, d := range decisions {
+		if d.Status == store.DecisionResolved {
+			if err := s.applyDecisionOutcome(ctx, d); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

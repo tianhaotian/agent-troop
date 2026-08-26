@@ -61,6 +61,27 @@ func TestIntentCreateMissionIdempotent(t *testing.T) {
 	}
 }
 
+func TestIntentRecoversReservedKeyWithoutMission(t *testing.T) {
+	s, st, clk := newService()
+	if _, err := st.PutIdempotent(ctx, "intent-poison", "msn_recovered", clk.Now()); err != nil {
+		t.Fatalf("reserve key: %v", err)
+	}
+	res, err := s.SubmitIntent(ctx, Intent{
+		Source: store.Actor{Kind: "human", ID: "u1"}, Action: IntentCreateMission,
+		IdempotencyKey: "poison", Owner: "u1", Goal: "recover",
+		Tasks: []TaskSpec{{Name: "a", Kind: mission.KindAgent}},
+	})
+	if err != nil {
+		t.Fatalf("SubmitIntent: %v", err)
+	}
+	if res.MissionID != "msn_recovered" || !res.Deduplicated {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if got := mustGet(t, s, res.MissionID, subID(res.MissionID, "a")); got.State != mission.StateReady {
+		t.Fatalf("recovered root = %s, want READY", got.State)
+	}
+}
+
 func TestIntentWake(t *testing.T) {
 	s, _, clk := newService()
 	mustRegisterScopes(t, s, "agt_a", []string{ScopeWake}, 2, "web.research")

@@ -3,13 +3,13 @@
 -- wake_* 为一次性唤醒注册（timer|manual + TTL，过期由 sweeper 置 FAILED）。
 
 ALTER TABLE subtasks
-    ADD COLUMN checkpoint     jsonb,
-    ADD COLUMN wake_kind      text,
-    ADD COLUMN wake_at        timestamptz,
-    ADD COLUMN wake_deadline  timestamptz;
+	ADD COLUMN IF NOT EXISTS checkpoint     jsonb,
+	ADD COLUMN IF NOT EXISTS wake_kind      text,
+	ADD COLUMN IF NOT EXISTS wake_at        timestamptz,
+	ADD COLUMN IF NOT EXISTS wake_deadline  timestamptz;
 
 -- sweeper 扫描：timer 到期唤醒 / TTL 过期回收（部分索引，仅 WAITING 行）
-CREATE INDEX idx_subtasks_waiting_due ON subtasks (wake_at)
+CREATE INDEX IF NOT EXISTS idx_subtasks_waiting_due ON subtasks (wake_at)
     WHERE state = 'WAITING';
-CREATE INDEX idx_subtasks_waiting_ttl ON subtasks (wake_deadline)
+CREATE INDEX IF NOT EXISTS idx_subtasks_waiting_ttl ON subtasks (wake_deadline)
     WHERE state = 'WAITING';

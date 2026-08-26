@@ -31,7 +31,20 @@ func testStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	// 应用全部迁移（按文件名序）+ 清场（测试库专用！）
+	applyMigrations(t, ctx, st)
+	// 清场（测试库专用！）
+	if _, err := st.pool.Exec(ctx,
+		`TRUNCATE missions, subtasks, agents, leases, artifacts, decisions, idempotency_keys,
+		 events, board_entries, lead_inbox, budget_holds, mission_budgets, context_packages`); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	t.Cleanup(st.Close)
+	return st
+}
+
+func applyMigrations(t *testing.T, ctx context.Context, st *Store) {
+	t.Helper()
+	// 应用全部迁移（按文件名序）。迁移文件必须支持在已升级数据库重复执行。
 	migs, err := filepath.Glob("../../../migrations/*.sql")
 	if err != nil || len(migs) == 0 {
 		t.Fatalf("glob migrations: %v", err)
@@ -46,17 +59,122 @@ func testStore(t *testing.T) *Store {
 			t.Fatalf("migrate %s: %v", f, err)
 		}
 	}
-	if _, err := st.pool.Exec(ctx,
-		`TRUNCATE missions, subtasks, agents, leases, artifacts, decisions, idempotency_keys, events, board_entries`); err != nil {
-		t.Fatalf("clean: %v", err)
+}
+
+func TestPGMigrationsIdempotent(t *testing.T) {
+	st := testStore(t) // first application
+	applyMigrations(t, context.Background(), st)
+}
+
+func TestPGBudgetHoldLifecycle(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	sys := store.Actor{Kind: "system", ID: "test"}
+	leadActor := store.Actor{Kind: "agent", ID: "agt_budget_lead"}
+	workerActor := store.Actor{Kind: "agent", ID: "agt_budget_worker"}
+	m := &mission.Mission{
+		ID: "msn_budget", Owner: "u1", Goal: "budget", BudgetTokens: 100, Status: mission.MissionActive,
 	}
-	t.Cleanup(st.Close)
-	return st
+	parent := &mission.Subtask{ID: "sub_budget_lead", MissionID: m.ID, Kind: mission.KindAgent,
+		State: mission.StateReady, Grants: mission.PermissionEnvelope{
+			Classification: mission.ClassificationInternal,
+			ArtifactRefs:   []string{"art_budget_context"},
+			BoardViews: []mission.BoardGrant{{Namespace: "shared", Keys: []string{"allowed"},
+				Mode: mission.BoardModeReadOnly}},
+		}}
+	if err := st.CreateMission(ctx, m, []*mission.Subtask{parent}, sys, now); err != nil {
+		t.Fatalf("CreateMission: %v", err)
+	}
+	artifact := &store.Artifact{ID: "art_budget_context", SHA256: "abc123", MissionID: m.ID,
+		ProducedBy: parent.ID, SchemaRef: "text/plain", Size: 3}
+	if err := st.PutArtifact(ctx, artifact, now); err != nil {
+		t.Fatalf("PutArtifact: %v", err)
+	}
+	if _, err := st.BoardPut(ctx, &store.BoardEntry{MissionID: m.ID, Namespace: "shared",
+		Key: "allowed", Value: []byte(`{"ok":true}`)}, -1, now); err != nil {
+		t.Fatalf("BoardPut: %v", err)
+	}
+	for _, a := range []*store.Agent{
+		{ID: leadActor.ID, Name: "lead", Platform: "custom", MaxConcurrency: 1, Health: "healthy"},
+		{ID: workerActor.ID, Name: "worker", Platform: "custom", MaxConcurrency: 1, Health: "healthy"},
+	} {
+		if err := st.UpsertAgent(ctx, a, now); err != nil {
+			t.Fatalf("UpsertAgent: %v", err)
+		}
+	}
+	leadLease, err := st.OfferLease(ctx, parent.ID, leadActor.ID, 0, time.Minute, sys, now)
+	if err != nil {
+		t.Fatalf("OfferLease lead: %v", err)
+	}
+	accepted, err := st.AcceptLease(ctx, leadLease.ID, leadLease.FencingToken, 1, leadActor, now)
+	if err != nil {
+		t.Fatalf("AcceptLease lead: %v", err)
+	}
+	runningLead, err := st.StartSubtask(ctx, parent.ID, leadLease.FencingToken, accepted.Version, leadActor, now)
+	if err != nil {
+		t.Fatalf("StartSubtask lead: %v", err)
+	}
+	child := &mission.Subtask{
+		ID: "sub_budget_child", MissionID: m.ID, ParentID: parent.ID, Kind: mission.KindAgent,
+		Scheduling: mission.SchedulingSpec{BudgetTokens: 60},
+		Grants: mission.PermissionEnvelope{Classification: mission.ClassificationInternal,
+			ArtifactRefs: []string{artifact.ID}, BoardViews: []mission.BoardGrant{{
+				Namespace: "shared", Keys: []string{"allowed"}, Mode: mission.BoardModeReadOnly,
+			}}},
+	}
+	if _, err := st.SpawnSubtask(ctx, "budget-child", parent.ID, leadLease.FencingToken,
+		runningLead.Version, child, leadActor, now); err != nil {
+		t.Fatalf("SpawnSubtask: %v", err)
+	}
+	tooLarge := &mission.Subtask{
+		ID: "sub_budget_too_large", MissionID: m.ID, ParentID: parent.ID, Kind: mission.KindAgent,
+		Scheduling: mission.SchedulingSpec{BudgetTokens: 50},
+	}
+	if _, err := st.SpawnSubtask(ctx, "budget-too-large", parent.ID, leadLease.FencingToken,
+		runningLead.Version, tooLarge, leadActor, now); !errors.Is(err, store.ErrBudgetExceeded) {
+		t.Fatalf("concurrent capacity check: %v", err)
+	}
+	account, err := st.GetMissionBudget(ctx, m.ID)
+	if err != nil || account.Held != 60 || account.Available != 40 {
+		t.Fatalf("held account=%+v err=%v", account, err)
+	}
+
+	childLease, err := st.OfferLease(ctx, child.ID, workerActor.ID, 1, time.Minute, sys, now)
+	if err != nil {
+		t.Fatalf("OfferLease child: %v", err)
+	}
+	pkg, err := st.GetContextPackage(ctx, childLease.ID)
+	if err != nil || len(pkg.Artifacts) != 1 || len(pkg.BoardViews) != 1 ||
+		pkg.Budget.Held != 60 || pkg.SnapshotHash == "" {
+		t.Fatalf("context package=%+v err=%v", pkg, err)
+	}
+	accepted, err = st.AcceptLease(ctx, childLease.ID, childLease.FencingToken, 2, workerActor, now)
+	if err != nil {
+		t.Fatalf("AcceptLease child: %v", err)
+	}
+	runningChild, err := st.StartSubtask(ctx, child.ID, childLease.FencingToken, accepted.Version, workerActor, now)
+	if err != nil {
+		t.Fatalf("StartSubtask child: %v", err)
+	}
+	if _, err := st.CompleteSubtaskWithUsage(ctx, child.ID, childLease.FencingToken,
+		"budget-complete", "artifact://budget", 40, runningChild.Version, workerActor, now); err != nil {
+		t.Fatalf("CompleteSubtaskWithUsage: %v", err)
+	}
+	account, _ = st.GetMissionBudget(ctx, m.ID)
+	holds, _ := st.ListBudgetHolds(ctx, m.ID)
+	if account.Held != 0 || account.Spent != 40 || account.Available != 60 ||
+		len(holds) != 1 || holds[0].Status != store.BudgetHoldSettled || holds[0].Actual != 40 {
+		t.Fatalf("settled account=%+v holds=%+v", account, holds)
+	}
 }
 
 func TestPGConformance(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
+	if err := st.Ping(ctx); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
 	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 	sys := store.Actor{Kind: "system", ID: "test"}
 	agt := store.Actor{Kind: "agent", ID: "agt_a"}
@@ -69,10 +187,20 @@ func TestPGConformance(t *testing.T) {
 	if err := st.CreateMission(ctx, m, subs, sys, now); err != nil {
 		t.Fatalf("CreateMission: %v", err)
 	}
+	if got, err := st.GetSubtask(ctx, "sub_pga"); err != nil || got.MissionID != m.ID {
+		t.Fatalf("GetSubtask: %+v err=%v", got, err)
+	}
 	if err := st.UpsertAgent(ctx, &store.Agent{ID: "agt_a", Name: "a", Platform: "http-echo",
-		Capabilities: []store.Capability{{Skill: "web.research", Level: 0.9}},
+		Capabilities:   []store.Capability{{Skill: "web.research", Level: 0.9}},
 		MaxConcurrency: 1, Health: "healthy"}, now); err != nil {
 		t.Fatalf("UpsertAgent: %v", err)
+	}
+	heartbeatAt := now.Add(time.Second)
+	if err := st.HeartbeatAgent(ctx, "agt_a", heartbeatAt); err != nil {
+		t.Fatalf("HeartbeatAgent: %v", err)
+	}
+	if a, err := st.GetAgent(ctx, "agt_a"); err != nil || !a.LastHeartbeat.Equal(heartbeatAt) {
+		t.Fatalf("heartbeat round trip: %+v err=%v", a, err)
 	}
 
 	sub, err := st.TransitionSubtask(ctx, "sub_pga", mission.EvDepsSatisfied, 0, sys, nil, now, nil)
@@ -215,7 +343,7 @@ func TestPGSpawnSubtask(t *testing.T) {
 			got = x
 		}
 	}
-	if got == nil || got.Input["topic"] != "t" || got.ParentID != parent.ID {
+	if got == nil || got.State != mission.StateReady || got.Input["topic"] != "t" || got.ParentID != parent.ID {
 		t.Fatalf("child spec round trip: %+v", got)
 	}
 	// succeeded 载荷含 subtask_id
@@ -236,5 +364,136 @@ func TestPGSpawnSubtask(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("subtask.succeeded payload must carry subtask_id")
+	}
+}
+
+func TestPGCreateDecisionAndBlock(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	sys := store.Actor{Kind: "system", ID: "hitl"}
+	m := &mission.Mission{ID: "msn_pg_hitl", Owner: "u1", Goal: "approve", Status: mission.MissionActive}
+	if err := st.CreateMission(ctx, m, []*mission.Subtask{
+		{ID: "sub_pg_gate", MissionID: m.ID, Kind: mission.KindHumanApproval, State: mission.StatePending},
+	}, sys, now); err != nil {
+		t.Fatalf("CreateMission: %v", err)
+	}
+	ready, err := st.TransitionSubtask(ctx, "sub_pg_gate", mission.EvDepsSatisfied, 0, sys, nil, now, nil)
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	d := &store.Decision{ID: "dec_pg_gate", MissionID: m.ID, SubtaskID: ready.ID,
+		Kind: "approval", Question: "ok?", Options: []string{"approve", "reject"}}
+	blocked, err := st.CreateDecisionAndBlock(ctx, d, ready.Version, nil, sys, now)
+	if err != nil {
+		t.Fatalf("CreateDecisionAndBlock: %v", err)
+	}
+	if blocked.State != mission.StateBlocked {
+		t.Fatalf("state=%s, want BLOCKED", blocked.State)
+	}
+	pending, err := st.ListDecisions(ctx, m.ID, true)
+	if err != nil || len(pending) != 1 || pending[0].DeciderID != "" {
+		t.Fatalf("pending decision: %+v err=%v", pending, err)
+	}
+}
+
+func TestPGLeadRecovery(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	sys := store.Actor{Kind: "system", ID: "test"}
+	leadActor := store.Actor{Kind: "agent", ID: "agt_lead"}
+	workerActor := store.Actor{Kind: "agent", ID: "agt_worker"}
+	m := &mission.Mission{ID: "msn_pg_lead", Owner: "u1", Goal: "recover", Status: mission.MissionActive}
+	if err := st.CreateMission(ctx, m, []*mission.Subtask{
+		{ID: "sub_pg_lead", MissionID: m.ID, Kind: mission.KindAgent, State: mission.StatePending},
+	}, sys, now); err != nil {
+		t.Fatalf("CreateMission: %v", err)
+	}
+	for _, a := range []*store.Agent{
+		{ID: "agt_lead", Name: "lead", Platform: "http-echo", Health: "healthy"},
+		{ID: "agt_worker", Name: "worker", Platform: "http-echo", Health: "healthy"},
+	} {
+		if err := st.UpsertAgent(ctx, a, now); err != nil {
+			t.Fatalf("UpsertAgent: %v", err)
+		}
+	}
+	if _, err := st.TransitionSubtask(ctx, "sub_pg_lead", mission.EvDepsSatisfied, 0, sys, nil, now, nil); err != nil {
+		t.Fatalf("activate lead: %v", err)
+	}
+	leadLease, err := st.OfferLease(ctx, "sub_pg_lead", "agt_lead", 1, 30*time.Second, sys, now)
+	if err != nil {
+		t.Fatalf("offer lead: %v", err)
+	}
+	lead, err := st.AcceptLease(ctx, leadLease.ID, leadLease.FencingToken, 2, leadActor, now)
+	if err != nil {
+		t.Fatalf("accept lead: %v", err)
+	}
+	lead, err = st.StartSubtask(ctx, lead.ID, leadLease.FencingToken, lead.Version, leadActor, now)
+	if err != nil {
+		t.Fatalf("start lead: %v", err)
+	}
+	snapshot, err := st.SaveLeadSnapshot(ctx, lead.ID, leadLease.FencingToken, -1,
+		[]byte(`{"intent":"review"}`), time.Minute, leadActor, now)
+	if err != nil || snapshot.Version != 0 {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
+	if _, err := st.SaveLeadSnapshot(ctx, lead.ID, leadLease.FencingToken, -1,
+		[]byte(`{"intent":"duplicate"}`), time.Minute, leadActor, now); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("snapshot create CAS: %v", err)
+	}
+	snapshot, err = st.SaveLeadSnapshot(ctx, lead.ID, leadLease.FencingToken, snapshot.Version,
+		[]byte(`{"intent":"ingest"}`), time.Minute, leadActor, now)
+	if err != nil || snapshot.Version != 1 {
+		t.Fatalf("snapshot update=%+v err=%v", snapshot, err)
+	}
+
+	child := &mission.Subtask{ID: "sub_pg_lead_child", MissionID: m.ID, ParentID: lead.ID, Kind: mission.KindAgent}
+	if _, err := st.SpawnSubtask(ctx, "pg-lead-child", lead.ID, leadLease.FencingToken,
+		lead.Version, child, leadActor, now); err != nil {
+		t.Fatalf("spawn child: %v", err)
+	}
+	childLease, err := st.OfferLease(ctx, child.ID, "agt_worker", 1, 30*time.Second, sys, now)
+	if err != nil {
+		t.Fatalf("offer child: %v", err)
+	}
+	child, err = st.AcceptLease(ctx, childLease.ID, childLease.FencingToken, 2, workerActor, now)
+	if err != nil {
+		t.Fatalf("accept child: %v", err)
+	}
+	child, err = st.StartSubtask(ctx, child.ID, childLease.FencingToken, child.Version, workerActor, now)
+	if err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	if _, err := st.CompleteSubtask(ctx, child.ID, childLease.FencingToken, "pg-lead-result",
+		"artifact://result", child.Version, workerActor, now); err != nil {
+		t.Fatalf("complete child: %v", err)
+	}
+	items, err := st.ListLeadInbox(ctx, lead.ID, true)
+	if err != nil || len(items) != 1 || items[0].SourceSubtaskID != child.ID {
+		t.Fatalf("inbox=%+v err=%v", items, err)
+	}
+	if _, err := st.IngestLeadInbox(ctx, items[0].ID, lead.ID, leadLease.FencingToken,
+		items[0].Version, store.LeadIngestSummary, workerActor, now); !errors.Is(err, store.ErrFenced) {
+		t.Fatalf("foreign ingest: %v", err)
+	}
+	ingested, err := st.IngestLeadInbox(ctx, items[0].ID, lead.ID, leadLease.FencingToken,
+		items[0].Version, store.LeadIngestSummary, leadActor, now)
+	if err != nil || ingested.Status != store.LeadInboxIngested {
+		t.Fatalf("ingest=%+v err=%v", ingested, err)
+	}
+
+	taken, err := st.TakeoverStaleLeads(ctx, now.Add(time.Minute+time.Second))
+	if err != nil || len(taken) != 1 || taken[0].State != mission.StateReady {
+		t.Fatalf("takeover=%+v err=%v", taken, err)
+	}
+	if oldLease, _ := st.GetLease(ctx, leadLease.ID); oldLease.State != store.LeaseFenced {
+		t.Fatalf("old lease=%+v", oldLease)
+	}
+	if oldAgent, _ := st.GetAgent(ctx, "agt_lead"); oldAgent.Health != "suspect" || oldAgent.Running != 0 {
+		t.Fatalf("old agent=%+v", oldAgent)
+	}
+	if gotChild, _ := st.GetSubtask(ctx, child.ID); gotChild.State != mission.StateSucceeded {
+		t.Fatalf("child changed during takeover: %s", gotChild.State)
 	}
 }

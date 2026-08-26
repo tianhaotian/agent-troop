@@ -6,22 +6,23 @@ import "fmt"
 type EventType string
 
 const (
-	EvCreated           EventType = "subtask.created"
-	EvDepsSatisfied     EventType = "subtask.deps_satisfied"
-	EvLeaseOffered      EventType = "subtask.lease_offered"
-	EvLeaseAccepted     EventType = "subtask.lease_accepted"
-	EvLeaseExpired      EventType = "subtask.lease_expired"   // 租约超时回收 → 回 READY
-	EvStarted           EventType = "subtask.started"
-	EvSuspended         EventType = "subtask.suspended"       // Agent 主动挂起（Continuation，§7.3）
-	EvWoken             EventType = "subtask.woken"           // Trigger Service 唤醒
-	EvBlocked           EventType = "subtask.blocked"         // 发起人工决策请求
-	EvDecisionApproved  EventType = "subtask.decision_approved"
-	EvDecisionRejected  EventType = "subtask.decision_rejected"
-	EvCompleted         EventType = "subtask.succeeded"
-	EvFailed            EventType = "subtask.failed"
-	EvRetried           EventType = "subtask.retried"         // 失败后重试 → 回 READY
-	EvWithdrawn         EventType = "subtask.withdrawn"       // 无人认领 → 策略重评估后回 READY
-	EvCancelled         EventType = "subtask.cancelled"
+	EvCreated          EventType = "subtask.created"
+	EvDepsSatisfied    EventType = "subtask.deps_satisfied"
+	EvLeaseOffered     EventType = "subtask.lease_offered"
+	EvLeaseAccepted    EventType = "subtask.lease_accepted"
+	EvLeaseExpired     EventType = "subtask.lease_expired" // 租约超时回收 → 回 READY
+	EvStarted          EventType = "subtask.started"
+	EvTakeover         EventType = "subtask.takeover_ready" // stale Lead 被 fence 后回 READY
+	EvSuspended        EventType = "subtask.suspended"      // Agent 主动挂起（Continuation，§7.3）
+	EvWoken            EventType = "subtask.woken"          // Trigger Service 唤醒
+	EvBlocked          EventType = "subtask.blocked"        // 发起人工决策请求
+	EvDecisionApproved EventType = "subtask.decision_approved"
+	EvDecisionRejected EventType = "subtask.decision_rejected"
+	EvCompleted        EventType = "subtask.succeeded"
+	EvFailed           EventType = "subtask.failed"
+	EvRetried          EventType = "subtask.retried"   // 失败后重试 → 回 READY
+	EvWithdrawn        EventType = "subtask.withdrawn" // 无人认领 → 策略重评估后回 READY
+	EvCancelled        EventType = "subtask.cancelled"
 )
 
 // transitions 合法迁移表：state → event → next。
@@ -51,6 +52,7 @@ var transitions = map[State]map[EventType]State{
 	StateRunning: {
 		EvCompleted: StateSucceeded,
 		EvFailed:    StateFailed,
+		EvTakeover:  StateReady,   // M7B：仅由 stale Lead sweeper 驱动
 		EvSuspended: StateWaiting, // Continuation：suspend + wake_on
 		EvBlocked:   StateBlocked, // 请求人工决策
 		EvCancelled: StateCancelled,

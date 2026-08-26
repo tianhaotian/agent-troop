@@ -14,10 +14,13 @@ import (
 
 // 并发/冲突错误：调用方（调度器、回调）遇 Conflict 应重读或放弃本次操作。
 var (
-	ErrConflict   = errors.New("store: version conflict or illegal transition")
-	ErrNotFound   = errors.New("store: not found")
-	ErrFenced     = errors.New("store: fencing token stale or lease not active")
-	ErrDuplicate  = errors.New("store: duplicate idempotency key")
+	ErrConflict           = errors.New("store: version conflict or illegal transition")
+	ErrNotFound           = errors.New("store: not found")
+	ErrFenced             = errors.New("store: fencing token stale or lease not active")
+	ErrDuplicate          = errors.New("store: duplicate idempotency key")
+	ErrBudgetRequired     = errors.New("store: budget slice required")
+	ErrBudgetExceeded     = errors.New("store: mission budget exceeded")
+	ErrPermissionExceeded = errors.New("store: delegated permission envelope exceeded")
 )
 
 // Actor 事件行为者（审计三元组之一，§10）。
@@ -56,7 +59,7 @@ type Agent struct {
 	Running        int               `json:"running"` // 在途租约数（放置调度用）
 	// TriggerScopes 触发授权（M5-H2，§7.4：默认收紧、按授权放开）。
 	// 注册时显式声明，缺省 []——即默认不能经 /v1/intents create_mission/wake。
-	TriggerScopes  []string          `json:"trigger_scopes,omitempty"`
+	TriggerScopes []string `json:"trigger_scopes,omitempty"`
 }
 
 // Lease 执行租约（§4.3：fencing token 单调递增防僵尸写入）。
@@ -121,12 +124,127 @@ type Artifact struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// LeadInboxItem 是 delegated child 向父 Lead 交付的显式上下文条目（§15.1）。
+type LeadInboxItem struct {
+	ID              string     `json:"id"`
+	MissionID       string     `json:"mission_id"`
+	LeadSubtaskID   string     `json:"lead_subtask_id"`
+	SourceSubtaskID string     `json:"source_subtask_id"`
+	Kind            string     `json:"kind"`
+	ResultRef       string     `json:"result_ref,omitempty"`
+	Status          string     `json:"status"`                // pending | ingested
+	IngestMode      string     `json:"ingest_mode,omitempty"` // summary | full
+	IngestedBy      string     `json:"ingested_by,omitempty"`
+	Version         int64      `json:"version"`
+	CreatedAt       time.Time  `json:"created_at"`
+	IngestedAt      *time.Time `json:"ingested_at,omitempty"`
+}
+
+const (
+	LeadInboxPending  = "pending"
+	LeadInboxIngested = "ingested"
+	LeadIngestSummary = "summary"
+	LeadIngestFull    = "full"
+)
+
+func LeadInboxID(sourceSubtaskID string) string { return "lin_" + sourceSubtaskID }
+
+// BudgetAccount 是 Mission 级 token 硬顶账户。Metered=false 表示兼容历史 Mission，
+// 不执行预算限制；Available 由 total-held-spent 派生并随查询返回。
+type BudgetAccount struct {
+	MissionID string    `json:"mission_id"`
+	Metered   bool      `json:"metered"`
+	Total     int64     `json:"total_tokens"`
+	Held      int64     `json:"held_tokens"`
+	Spent     int64     `json:"spent_tokens"`
+	Available int64     `json:"available_tokens"`
+	Version   int64     `json:"version"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
+// BudgetHold 记录一次 delegated subtask 的预估与实际用量。
+type BudgetHold struct {
+	ID        string     `json:"id"`
+	MissionID string     `json:"mission_id"`
+	SubtaskID string     `json:"subtask_id"`
+	Attempt   int        `json:"attempt"`
+	Amount    int64      `json:"amount_tokens"`
+	Actual    int64      `json:"actual_tokens"`
+	Status    string     `json:"status"` // HELD | SETTLED | RELEASED
+	CreatedAt time.Time  `json:"created_at"`
+	SettledAt *time.Time `json:"settled_at,omitempty"`
+}
+
+const (
+	BudgetHoldHeld     = "HELD"
+	BudgetHoldSettled  = "SETTLED"
+	BudgetHoldReleased = "RELEASED"
+)
+
+func BudgetHoldID(subtaskID string) string { return "bhd_" + subtaskID }
+
+// ContextBoardEntry 是授权黑板切片在 dispatch 时的不可变视图。
+type ContextBoardEntry struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value"`
+	Version   int64  `json:"version"`
+	Mode      string `json:"mode"`
+}
+
+type ContextDecision struct {
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Question string `json:"question"`
+	Status   string `json:"status"`
+	Choice   string `json:"choice,omitempty"`
+}
+
+type ContextTask struct {
+	ID             string                     `json:"id"`
+	MissionID      string                     `json:"mission_id"`
+	ParentID       string                     `json:"parent_id,omitempty"`
+	Kind           mission.Kind               `json:"kind"`
+	RequiredSkills []string                   `json:"required_skills,omitempty"`
+	Scheduling     mission.SchedulingSpec     `json:"scheduling"`
+	Retry          mission.RetryPolicy        `json:"retry"`
+	Input          map[string]any             `json:"input,omitempty"`
+	ReworkOf       string                     `json:"rework_of,omitempty"`
+	Grants         mission.PermissionEnvelope `json:"grants"`
+	Checkpoint     []byte                     `json:"checkpoint,omitempty"`
+	WakeKind       string                     `json:"wake_kind,omitempty"`
+	WakeAt         *time.Time                 `json:"wake_at,omitempty"`
+	WakeDeadline   *time.Time                 `json:"wake_deadline,omitempty"`
+	WakeSpec       []byte                     `json:"wake_spec,omitempty"`
+}
+
+// ContextPackage 是按 lease 物化的最小知情快照；SnapshotHash 不含 lease/时间元数据。
+type ContextPackage struct {
+	ID           string               `json:"id"`
+	LeaseID      string               `json:"lease_id"`
+	MissionID    string               `json:"mission_id"`
+	SubtaskID    string               `json:"subtask_id"`
+	Task         ContextTask          `json:"task_spec"`
+	Artifacts    []*Artifact          `json:"artifacts"`
+	BoardViews   []*ContextBoardEntry `json:"board_views"`
+	Decisions    []*ContextDecision   `json:"decisions_digest"`
+	Budget       *BudgetAccount       `json:"budget"`
+	SnapshotHash string               `json:"snapshot_hash"`
+	CreatedAt    time.Time            `json:"created_at"`
+}
+
 // Store 存储接口。memory 实现用于测试与本地零依赖运行；pg 实现用于真实部署。
 type Store interface {
+	// Ping 验证当前存储依赖可用；供 readiness 使用，不执行写操作。
+	Ping(ctx context.Context) error
+
 	// ---- 任务面 ----
 	// CreateMission 在一个事务内写入 Mission、全部 Subtask（PENDING）与创建事件。
 	CreateMission(ctx context.Context, m *mission.Mission, subs []*mission.Subtask, actor Actor, now time.Time) error
 	GetMission(ctx context.Context, id string) (*mission.Mission, error)
+	GetMissionBudget(ctx context.Context, missionID string) (*BudgetAccount, error)
+	ListBudgetHolds(ctx context.Context, missionID string) ([]*BudgetHold, error)
+	GetSubtask(ctx context.Context, id string) (*mission.Subtask, error)
 	ListSubtasks(ctx context.Context, missionID string) ([]*mission.Subtask, error)
 	// ListSubtasksByState 按状态扫描（OFFERED 拉取等；pg 走部分索引）。
 	ListSubtasksByState(ctx context.Context, st mission.State) ([]*mission.Subtask, error)
@@ -159,6 +277,7 @@ type Store interface {
 		actor Actor, now time.Time) (*mission.Subtask, error)
 	// GetLease 查询租约（Adapter 拉取 offer 时需连同 fencing token 下发）。
 	GetLease(ctx context.Context, id string) (*Lease, error)
+	GetContextPackage(ctx context.Context, leaseID string) (*ContextPackage, error)
 	// RenewLease 延长活跃租约（progress 心跳驱动）。
 	RenewLease(ctx context.Context, leaseID string, fencingToken int64, ttl time.Duration, now time.Time) error
 	// ExpireLeases 回收到期活跃租约：LEASED/OFFERED 态子任务回 READY。返回回收数量。
@@ -172,6 +291,9 @@ type Store interface {
 	// RUNNING→SUCCEEDED、写 result_ref、释放租约。
 	CompleteSubtask(ctx context.Context, id string, fencingToken int64, idemKey, resultRef string,
 		expectedVersion int64, actor Actor, now time.Time) (*mission.Subtask, error)
+	// CompleteSubtaskWithUsage 与 CompleteSubtask 相同，并在同一事务内按实际 token 结算预算 hold。
+	CompleteSubtaskWithUsage(ctx context.Context, id string, fencingToken int64, idemKey, resultRef string,
+		usageTokens, expectedVersion int64, actor Actor, now time.Time) (*mission.Subtask, error)
 	// FailSubtask 校验 fencing token，RUNNING→FAILED、记录原因、释放租约。
 	FailSubtask(ctx context.Context, id string, fencingToken int64, reason string,
 		expectedVersion int64, actor Actor, now time.Time) (*mission.Subtask, error)
@@ -179,15 +301,30 @@ type Store interface {
 	// 注意：BLOCKED 不释放租约——裁决批准后原 Agent 续跑。
 	BlockSubtask(ctx context.Context, id string, fencingToken int64, expectedVersion int64,
 		actor Actor, now time.Time) (*mission.Subtask, error)
+	// CancelSubtask 原子完成状态取消、活跃租约释放与取消事件追加。
+	CancelSubtask(ctx context.Context, id string, expectedVersion int64,
+		actor Actor, now time.Time) (*mission.Subtask, error)
 
 	// ---- 主子委托（M6，§15.1） ----
 	// SpawnSubtask 原子完成（CompleteSubtask 同构）：幂等键撞键返回 ErrDuplicate +
 	// existingID（原子女 ID）；否则校验父任务 fencing token + RUNNING 态 + version，
-	// 插入子女（PENDING，parent_id 因果链）并追加创建事件。
+	// 插入子女并原子激活为 READY（parent_id 因果链），追加创建/就绪事件。
 	SpawnSubtask(ctx context.Context, idemKey, parentID string, fencingToken, parentVersion int64,
 		child *mission.Subtask, actor Actor, now time.Time) (existingID string, err error)
 	// CountChildren 统计某子任务的直接子女数（delegate fanout 校验）。
 	CountChildren(ctx context.Context, parentID string) (int, error)
+
+	// ---- Lead 恢复闭环（M7B，§15.1/§15.2/§15.4） ----
+	ListLeadInbox(ctx context.Context, leadSubtaskID string, pendingOnly bool) ([]*LeadInboxItem, error)
+	// IngestLeadInbox 在活跃 Lead 租约保护下 CAS 标记显式摄入。
+	IngestLeadInbox(ctx context.Context, itemID, leadSubtaskID string, fencingToken, expectedVersion int64,
+		mode string, actor Actor, now time.Time) (*LeadInboxItem, error)
+	// SaveLeadSnapshot 原子完成 owner/fencing 校验、lead-plan CAS 快照写入与租约续期。
+	// expectedVersion=-1 表示仅首次创建；>=0 表示更新指定版本。
+	SaveLeadSnapshot(ctx context.Context, leadSubtaskID string, fencingToken, expectedVersion int64,
+		value []byte, leaseTTL time.Duration, actor Actor, now time.Time) (*BoardEntry, error)
+	// TakeoverStaleLeads fence 到期 RUNNING Lead，将协调任务回 READY；不影响其 child。
+	TakeoverStaleLeads(ctx context.Context, now time.Time) ([]*mission.Subtask, error)
 
 	// ---- 挂起-唤醒（M3/M4，§7.3/§14.4） ----
 	// SuspendSubtask 校验 fencing token，RUNNING→WAITING 并**释放租约**
@@ -226,6 +363,10 @@ type Store interface {
 
 	// ---- 决策（M2） ----
 	CreateDecision(ctx context.Context, d *Decision, now time.Time) error
+	// CreateDecisionAndBlock 原子完成子任务 BLOCKED 迁移与决策工单创建。
+	// fencingToken=nil 用于 READY human 节点；非 nil 用于 RUNNING Agent 主动请求。
+	CreateDecisionAndBlock(ctx context.Context, d *Decision, expectedSubVersion int64,
+		fencingToken *int64, actor Actor, now time.Time) (*mission.Subtask, error)
 	GetDecision(ctx context.Context, id string) (*Decision, error)
 	ListDecisions(ctx context.Context, missionID string, pendingOnly bool) ([]*Decision, error)
 	// ResolveDecision 裁决（CAS：仅 pending 可裁决，重复裁决返回 ErrConflict）。

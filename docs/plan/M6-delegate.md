@@ -29,7 +29,7 @@
 2. **委托关系用 parent_id 而非 depends_on 表达**：子女不参与 DAG 依赖传播（依赖是"Lead 的委托决策"而非数据先后），即建即 READY；Mission 终态推导天然正确——子女非终态时 Mission 不会完结；
 3. **fencing 即委托权**：delegate 必须持父任务的活跃租约（fencing token + version 校验，与 start/complete 同规格）——防止非执行中的 Agent 冒名派生，也天然保证"只有 RUNNING 中的 Lead 能 delegate"（§15.1 时序约束）；
 4. **幂等键复用 intent- 命名空间**：delegate 必填 idempotency_key，result=子女 subtask id；重发返回原子女 + `deduplicated:true`（与 create_mission 语义一致，§15.1"所有消息携带幂等键"）；
-5. **fencing + 幂等 + 落库同一原子操作**（沿用 CompleteSubtask 模式）：`SpawnSubtask` 在 store 层一个事务内完成幂等键检查（撞键返回 ErrDuplicate + 原子女 ID）→ 父任务 fencing/RUNNING 校验 → 子女插入 → 事件追加——无占位窗口，重试/并发双发恰好一次。结构校验（depth/fanout/max_rework）在 core 层先于 store 调用，失败不消耗键（同 M4 早失败原则）；管道顺序：鉴权（M5）→ core 校验 → store 原子落库；
+5. **fencing + 幂等 + 落库同一原子操作**（沿用 CompleteSubtask 模式）：`SpawnSubtask` 在 store 层一个事务内完成幂等键检查（撞键返回 ErrDuplicate + 原子女 ID）→ 父任务 fencing/RUNNING 校验 → 子女插入并激活 READY → 事件追加——无 PENDING 占位窗口，重试/并发双发恰好一次。结构校验（depth/fanout/max_rework）在 core 层先于 store 调用，失败不消耗键（同 M4 早失败原则）；管道顺序：鉴权（M5）→ core 校验 → store 原子落库；
 6. **depth/fanout 配置化**：`Config.MaxDelegateDepth`（默认 4）、`MaxDelegateFanout`（默认 8）、`MaxRework`（默认 3）；depth 沿 parent_id 链上溯计算，fanout 按同父子任务计数；
 7. **事件留痕（§7.4(6) 因果审计）**：子女创建事件 payload 带 `parent_subtask_id` / `rework_of` / actor=Lead agent——从任一子任务可沿事件反查完整触发链；`subtask.succeeded` 载荷补 `subtask_id`（双 store），Lead `wake_on.event.where={"subtask_id":"sub_7"}` 精确等待。
 
@@ -37,7 +37,7 @@
 
 - `mission.Subtask` 增 `Input map[string]any`（delegate 子女的任务载荷；pg 落 spec jsonb，**无需改表**）与 `ReworkOf string`（同）；ParentID 列已存在（0001）；
 - Store 接口新增：
-  - `SpawnSubtask(ctx, idemKey, parentID string, fencingToken, parentVersion int64, child *mission.Subtask, actor Actor, now time.Time) (existingID string, err error)`——原子完成（CompleteSubtask 同构）：幂等键撞键返回 ErrDuplicate + 原子女 ID；父任务 fencing + RUNNING 校验 → 子女插入（PENDING）→ 事件追加；
+  - `SpawnSubtask(ctx, idemKey, parentID string, fencingToken, parentVersion int64, child *mission.Subtask, actor Actor, now time.Time) (existingID string, err error)`——原子完成（CompleteSubtask 同构）：幂等键撞键返回 ErrDuplicate + 原子女 ID；父任务 fencing + RUNNING 校验 → 子女插入并激活 READY → 事件追加；
   - `CountChildren(ctx, parentID string) (int, error)`（fanout 校验）；
   - `subtask.succeeded` 载荷增 `subtask_id`（pg + memory 双实现）；
 - core：`Service.Delegate(ctx, in Intent)` 编排水线 + depth 计算（沿 ParentID 上溯，上限 MaxDelegateDepth 截断防环）；

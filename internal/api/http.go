@@ -25,10 +25,12 @@ func New(svc *core.Service) *Server { return &Server{svc: svc} }
 func (s *Server) Handler() http.Handler {
 	mux := newRouter()
 	mux.handle("GET /healthz", s.healthz)
+	mux.handle("GET /readyz", s.readyz)
 
 	// 任务面
 	mux.handle("POST /v1/missions", s.createMission)
 	mux.handle("GET /v1/missions/{id}", s.getMission)
+	mux.handle("GET /v1/missions/{id}/budget", s.getMissionBudget)
 	mux.handle("POST /v1/missions/{id}/cancel", s.cancelMission)
 	mux.handle("GET /v1/missions/{id}/events", s.missionEventsSSE)
 
@@ -39,12 +41,18 @@ func (s *Server) Handler() http.Handler {
 
 	// 执行面（Agent 回调）
 	mux.handle("POST /v1/leases/{id}/accept", s.acceptLease)
+	mux.handle("GET /v1/leases/{id}/context", s.getLeaseContext)
 	mux.handle("POST /v1/subtasks/{id}/start", s.startSubtask)
 	mux.handle("POST /v1/subtasks/{id}/progress", s.progress)
 	mux.handle("POST /v1/subtasks/{id}/complete", s.completeSubtask)
 	mux.handle("POST /v1/subtasks/{id}/fail", s.failSubtask)
 	mux.handle("POST /v1/subtasks/{id}/suspend", s.suspend) // M3-T4
 	mux.handle("POST /v1/subtasks/{id}/wake", s.wake)       // M3-T4
+	// Lead 恢复闭环（M7B）
+	mux.handle("GET /v1/subtasks/{id}/lead/inbox", s.listLeadInbox)
+	mux.handle("POST /v1/subtasks/{id}/lead/inbox/{item}/ingest", s.ingestLeadInbox)
+	mux.handle("POST /v1/subtasks/{id}/lead/heartbeat", s.leadHeartbeat)
+	mux.handle("GET /v1/subtasks/{id}/lead/context", s.leadContext)
 
 	// 人工面（M2）
 	mux.handle("GET /v1/decisions", s.listDecisions)
@@ -89,6 +97,14 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case errors.Is(err, core.ErrInvalidCondition):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()}) // M5：CEL 注册校验
+	case errors.Is(err, core.ErrInvalidLeadInput):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, core.ErrInvalidBudget), errors.Is(err, store.ErrBudgetRequired):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, core.ErrInvalidPermission), errors.Is(err, store.ErrPermissionExceeded):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, store.ErrBudgetExceeded):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 	case errors.Is(err, core.ErrForbidden):
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()}) // M5：触发 scope 鉴权
 	default:
@@ -104,16 +120,40 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+func readBodyLimited(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	body, err := io.ReadAll(r.Body)
+	if err == nil {
+		return body, true
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+	} else {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+	return nil, false
+}
+
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	if err := s.svc.Ready(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 // ---- 任务面 ----
 
 type createMissionReq struct {
-	Owner string           `json:"owner"`
-	Goal  string           `json:"goal"`
-	Tasks []core.TaskSpec  `json:"tasks"`
+	Owner        string          `json:"owner"`
+	Goal         string          `json:"goal"`
+	BudgetTokens int64           `json:"budget_tokens,omitempty"`
+	Tasks        []core.TaskSpec `json:"tasks"`
 }
 
 func (s *Server) createMission(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +165,7 @@ func (s *Server) createMission(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner/goal/tasks required"})
 		return
 	}
-	m, err := s.svc.CreateMission(r.Context(), req.Owner, req.Goal, req.Tasks)
+	m, err := s.svc.CreateMissionWithBudget(r.Context(), req.Owner, req.Goal, req.BudgetTokens, req.Tasks)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -146,6 +186,15 @@ func (s *Server) getMission(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"mission": m, "subtasks": subs})
+}
+
+func (s *Server) getMissionBudget(w http.ResponseWriter, r *http.Request) {
+	account, holds, err := s.svc.GetMissionBudget(r.Context(), pv(r, "id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account": account, "holds": holds})
 }
 
 func (s *Server) cancelMission(w http.ResponseWriter, r *http.Request) {
@@ -194,7 +243,7 @@ func (s *Server) missionEventsSSE(w http.ResponseWriter, r *http.Request) {
 			}
 			for _, e := range evs {
 				data, _ := json.Marshal(e)
-				fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.Seq, e.Type, data)
+				fmt.Fprintf(w, "id: %d\ndata: %s\n\n", e.Seq, data)
 				after = e.Seq
 			}
 			flusher.Flush()
@@ -212,7 +261,7 @@ type registerAgentReq struct {
 	Capabilities   []store.Capability `json:"capabilities"`
 	MaxConcurrency int                `json:"max_concurrency,omitempty"`
 	// TriggerScopes M5-H2：触发授权（§7.4；缺省 [] 默认收紧）
-	TriggerScopes  []string           `json:"trigger_scopes,omitempty"`
+	TriggerScopes []string `json:"trigger_scopes,omitempty"`
 }
 
 func (s *Server) registerAgent(w http.ResponseWriter, r *http.Request) {
@@ -245,9 +294,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 type offerView struct {
-	Subtask      *mission.Subtask `json:"subtask"`
-	LeaseID      string           `json:"lease_id"`
-	FencingToken int64            `json:"fencing_token"`
+	Subtask        *mission.Subtask      `json:"subtask"`
+	LeaseID        string                `json:"lease_id"`
+	FencingToken   int64                 `json:"fencing_token"`
+	ContextPackage *store.ContextPackage `json:"context_package"`
 }
 
 func (s *Server) listOffers(w http.ResponseWriter, r *http.Request) {
@@ -262,9 +312,23 @@ func (s *Server) listOffers(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		views = append(views, offerView{Subtask: sub, LeaseID: l.ID, FencingToken: l.FencingToken})
+		pkg, err := s.svc.GetContextPackage(r.Context(), l.ID)
+		if err != nil {
+			continue
+		}
+		views = append(views, offerView{Subtask: sub, LeaseID: l.ID,
+			FencingToken: l.FencingToken, ContextPackage: pkg})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"offers": views})
+}
+
+func (s *Server) getLeaseContext(w http.ResponseWriter, r *http.Request) {
+	pkg, err := s.svc.GetContextPackage(r.Context(), pv(r, "id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, pkg)
 }
 
 // ---- 执行面 ----
@@ -308,6 +372,7 @@ func (s *Server) startSubtask(w http.ResponseWriter, r *http.Request) {
 }
 
 type progressReq struct {
+	AgentID      string          `json:"agent_id"`
 	LeaseID      string          `json:"lease_id"`
 	FencingToken int64           `json:"fencing_token"`
 	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"` // M3-T3：检查点续跑
@@ -318,20 +383,92 @@ func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := s.svc.Progress(r.Context(), pv(r, "id"), req.LeaseID, req.FencingToken, req.Checkpoint); err != nil {
+	if err := s.svc.Progress(r.Context(), pv(r, "id"), req.LeaseID, req.FencingToken, req.AgentID, req.Checkpoint); err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "renewed"})
 }
 
+func (s *Server) listLeadInbox(w http.ResponseWriter, r *http.Request) {
+	status := r.URL.Query().Get("status")
+	if status == "" {
+		status = store.LeadInboxPending
+	}
+	if status != store.LeadInboxPending && status != "all" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be pending or all"})
+		return
+	}
+	items, err := s.svc.ListLeadInbox(r.Context(), pv(r, "id"), status == store.LeadInboxPending)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+type ingestLeadInboxReq struct {
+	AgentID         string `json:"agent_id"`
+	FencingToken    int64  `json:"fencing_token"`
+	ExpectedVersion int64  `json:"expected_version"`
+	Mode            string `json:"mode"`
+}
+
+func (s *Server) ingestLeadInbox(w http.ResponseWriter, r *http.Request) {
+	var req ingestLeadInboxReq
+	if !decode(w, r, &req) {
+		return
+	}
+	item, err := s.svc.IngestLeadInbox(r.Context(), pv(r, "id"), pv(r, "item"), req.AgentID,
+		req.FencingToken, req.ExpectedVersion, req.Mode)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+type leadHeartbeatReq struct {
+	AgentID         string          `json:"agent_id"`
+	FencingToken    int64           `json:"fencing_token"`
+	ExpectedVersion *int64          `json:"expected_version"`
+	Snapshot        json.RawMessage `json:"snapshot"`
+}
+
+func (s *Server) leadHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var req leadHeartbeatReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.ExpectedVersion == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected_version required"})
+		return
+	}
+	entry, err := s.svc.SaveLeadSnapshot(r.Context(), pv(r, "id"), req.AgentID,
+		req.FencingToken, *req.ExpectedVersion, req.Snapshot)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+func (s *Server) leadContext(w http.ResponseWriter, r *http.Request) {
+	ctx, err := s.svc.GetLeadContext(r.Context(), pv(r, "id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ctx)
+}
+
 // suspendReq M3-T4/M4：Agent 挂起自身（Continuation，§7.3）。
 type suspendReq struct {
-	AgentID      string             `json:"agent_id"`
-	FencingToken int64              `json:"fencing_token"`
-	Version      int64              `json:"version"`
-	WakeOn       mission.WakeSpec   `json:"wake_on"`
-	Checkpoint   json.RawMessage    `json:"checkpoint,omitempty"`
+	AgentID      string           `json:"agent_id"`
+	FencingToken int64            `json:"fencing_token"`
+	Version      int64            `json:"version"`
+	WakeOn       mission.WakeSpec `json:"wake_on"`
+	Checkpoint   json.RawMessage  `json:"checkpoint,omitempty"`
 }
 
 func (s *Server) suspend(w http.ResponseWriter, r *http.Request) {
@@ -373,6 +510,7 @@ type completeReq struct {
 	Version        int64  `json:"version"`
 	IdempotencyKey string `json:"idempotency_key"`
 	ResultRef      string `json:"result_ref"`
+	UsageTokens    int64  `json:"usage_tokens,omitempty"`
 }
 
 func (s *Server) completeSubtask(w http.ResponseWriter, r *http.Request) {
@@ -380,8 +518,8 @@ func (s *Server) completeSubtask(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	sub, err := s.svc.CompleteSubtask(r.Context(), pv(r, "id"),
-		req.FencingToken, req.IdempotencyKey, req.ResultRef, req.Version, req.AgentID)
+	sub, err := s.svc.CompleteSubtaskWithUsage(r.Context(), pv(r, "id"),
+		req.FencingToken, req.IdempotencyKey, req.ResultRef, req.UsageTokens, req.Version, req.AgentID)
 	if errors.Is(err, store.ErrDuplicate) {
 		// 幂等重放：返回 200 + 原状态（§4.3 重试安全）
 		writeJSON(w, http.StatusOK, map[string]any{"subtask": sub, "deduplicated": true})
@@ -512,11 +650,11 @@ func (s *Server) boardGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) boardPut(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	body, ok := readBodyLimited(w, r, 1<<20)
+	if !ok {
 		return
 	}
+	var err error
 	expected := int64(-1)
 	if v := r.Header.Get("X-Expected-Version"); v != "" {
 		expected, err = strconv.ParseInt(v, 10, 64)
@@ -541,9 +679,8 @@ func (s *Server) putArtifact(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Mission-ID required"})
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	body, ok := readBodyLimited(w, r, 64<<20)
+	if !ok {
 		return
 	}
 	a, err := s.svc.PutArtifact(r.Context(), missionID,

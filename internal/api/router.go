@@ -37,7 +37,11 @@ func (rt *router) handle(pattern string, h http.HandlerFunc) {
 	if len(parts) != 2 {
 		panic("api: bad route pattern " + pattern)
 	}
-	segs := strings.Split(strings.Trim(parts[1], "/"), "/")
+	path := strings.Trim(parts[1], "/")
+	var segs []string
+	if path != "" {
+		segs = strings.Split(path, "/")
+	}
 	rt.routes = append(rt.routes, route{method: parts[0], segs: segs, h: h})
 }
 

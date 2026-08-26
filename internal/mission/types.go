@@ -36,11 +36,11 @@ func (s State) Terminal() bool {
 type Kind string
 
 const (
-	KindAgent          Kind = "agent"
-	KindHumanApproval  Kind = "human_approval"
-	KindHumanDecision  Kind = "human_decision"
-	KindAggregation    Kind = "aggregation"
-	KindCondition      Kind = "condition"
+	KindAgent         Kind = "agent"
+	KindHumanApproval Kind = "human_approval"
+	KindHumanDecision Kind = "human_decision"
+	KindAggregation   Kind = "aggregation"
+	KindCondition     Kind = "condition"
 )
 
 // MissionStatus 使命状态。
@@ -68,30 +68,46 @@ type SchedulingSpec struct {
 	Exclusive    bool       `json:"exclusive,omitempty"`
 }
 
+// BoardGrant 是上下文包中的黑板切片授权。Keys 为空表示整个 namespace。
+type BoardGrant struct {
+	Namespace string   `json:"namespace"`
+	Keys      []string `json:"keys,omitempty"`
+	Mode      string   `json:"mode"` // ro | rw
+}
+
+// PermissionEnvelope 是任务可见数据与工具能力的最大包络；delegate 只能衰减。
+type PermissionEnvelope struct {
+	Classification string       `json:"classification,omitempty"` // public|internal|confidential|restricted
+	ToolScopes     []string     `json:"tool_scopes,omitempty"`
+	ArtifactRefs   []string     `json:"artifact_refs,omitempty"`
+	BoardViews     []BoardGrant `json:"board_views,omitempty"`
+}
+
 // Subtask 可执行最小单元。
 type Subtask struct {
-	ID         string          `json:"id"`
-	MissionID  string          `json:"mission_id"`
-	ParentID   string          `json:"parent_id,omitempty"`
-	Kind       Kind            `json:"kind"`
-	RequiredSkills []string    `json:"required_skills,omitempty"`
-	DependsOn  []string        `json:"depends_on,omitempty"`
-	Scheduling SchedulingSpec  `json:"scheduling"`
-	Retry      RetryPolicy     `json:"retry"`
-	State      State           `json:"state"`
-	Assignee   string          `json:"assignee_agent_id,omitempty"`
-	LeaseID    string          `json:"lease_id,omitempty"`
-	Attempt    int             `json:"attempt"`
-	ResultRef  string          `json:"result_ref,omitempty"`
-	Version    int64           `json:"version"` // 乐观锁（§4.3）
+	ID             string         `json:"id"`
+	MissionID      string         `json:"mission_id"`
+	ParentID       string         `json:"parent_id,omitempty"`
+	Kind           Kind           `json:"kind"`
+	RequiredSkills []string       `json:"required_skills,omitempty"`
+	DependsOn      []string       `json:"depends_on,omitempty"`
+	Scheduling     SchedulingSpec `json:"scheduling"`
+	Retry          RetryPolicy    `json:"retry"`
+	State          State          `json:"state"`
+	Assignee       string         `json:"assignee_agent_id,omitempty"`
+	LeaseID        string         `json:"lease_id,omitempty"`
+	Attempt        int            `json:"attempt"`
+	ResultRef      string         `json:"result_ref,omitempty"`
+	Version        int64          `json:"version"` // 乐观锁（§4.3）
 	// human 节点（M2）：裁决工单的内容与超时策略
-	Question   string          `json:"question,omitempty"`
-	Options    []string        `json:"options,omitempty"`
-	OnTimeout  string          `json:"on_timeout,omitempty"` // auto_approve | auto_reject | ""
+	Question  string   `json:"question,omitempty"`
+	Options   []string `json:"options,omitempty"`
+	OnTimeout string   `json:"on_timeout,omitempty"` // auto_approve | auto_reject | ""
 	// 主子委托（M6，§15.1）：delegate 子女的任务载荷与 rework 链。
 	// ParentID（0001 已有）表达委托关系——子女不参与 DAG 依赖传播，即建即 READY。
-	Input      map[string]any  `json:"input,omitempty"`    // 任务载荷（rework 时含 feedback）
-	ReworkOf   string          `json:"rework_of,omitempty"` // 本任务是对该子任务的验收不通过重派
+	Input    map[string]any     `json:"input,omitempty"`     // 任务载荷（rework 时含 feedback）
+	ReworkOf string             `json:"rework_of,omitempty"` // 本任务是对该子任务的验收不通过重派
+	Grants   PermissionEnvelope `json:"grants,omitempty"`    // M7D：权限包络与上下文显式 grant
 	// Continuation（M3/M4，§7.3）：挂起-唤醒与检查点续跑
 	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"`    // 透明载荷（≤64KB），续跑 Agent 自行解释
 	WakeKind     string          `json:"wake_kind,omitempty"`     // timer | manual | event | condition
@@ -112,7 +128,7 @@ const (
 type WakeSpec struct {
 	Kind         string          `json:"kind"` // timer | manual | event | condition
 	At           *time.Time      `json:"at,omitempty"`
-	Deadline     *time.Time      `json:"deadline"` // TTL（防永久悬挂）
+	Deadline     *time.Time      `json:"deadline"`                // TTL（防永久悬挂）
 	RegisteredAt *time.Time      `json:"registered_at,omitempty"` // 注册时刻（平台写入；CEL elapsed() 基准）
 	Event        *EventMatch     `json:"event,omitempty"`
 	Condition    *BoardCondition `json:"condition,omitempty"`
@@ -129,6 +145,7 @@ type EventMatch struct {
 //   - 结构化谓词（M4）：Board + Op(+Value)，求值器语义不变；
 //   - CEL 表达式（M5-H1）：Expr，数据模型 board.<ns>.<key> / mission.* / subtask.* /
 //     elapsed() / deadline_in()（§14.3）。
+//
 // Refs/RefsWildcard 为注册时静态提取的 board 引用键集（"ns/key"，"ns/*" 表整命名空间），
 // 供 BoardPut 增量评估过滤；提取遇动态下标等不可判定形态置 RefsWildcard（宁多评不漏评）。
 type BoardCondition struct {
@@ -148,9 +165,10 @@ const (
 
 // Mission 顶层目标。
 type Mission struct {
-	ID        string         `json:"id"`
-	Owner     string         `json:"owner"`
-	Goal      string         `json:"goal"`
-	Status    MissionStatus  `json:"status"`
-	Version   int64          `json:"version"`
+	ID           string        `json:"id"`
+	Owner        string        `json:"owner"`
+	Goal         string        `json:"goal"`
+	BudgetTokens int64         `json:"budget_tokens,omitempty"`
+	Status       MissionStatus `json:"status"`
+	Version      int64         `json:"version"`
 }

@@ -17,6 +17,7 @@ func TestApply_LegalTransitions(t *testing.T) {
 		{StateOffered, EvLeaseAccepted, StateLeased},
 		{StateLeased, EvStarted, StateRunning},
 		{StateRunning, EvCompleted, StateSucceeded},
+		{StateRunning, EvTakeover, StateReady},
 
 		// 租约回收：OFFERED/LEASED 超时回 READY；OFFERED 撤回重评估
 		{StateOffered, EvLeaseExpired, StateReady},
@@ -67,7 +68,7 @@ func TestApply_CancelFromAnyNonTerminal(t *testing.T) {
 func TestApply_TerminalStatesRejectEverything(t *testing.T) {
 	allEvents := []EventType{
 		EvCreated, EvDepsSatisfied, EvLeaseOffered, EvLeaseAccepted, EvLeaseExpired,
-		EvStarted, EvSuspended, EvWoken, EvBlocked, EvDecisionApproved,
+		EvStarted, EvTakeover, EvSuspended, EvWoken, EvBlocked, EvDecisionApproved,
 		EvDecisionRejected, EvCompleted, EvFailed, EvRetried, EvWithdrawn, EvCancelled,
 	}
 	for _, s := range []State{StateSucceeded, StateCancelled} {
@@ -91,16 +92,16 @@ func TestApply_IllegalTransitions(t *testing.T) {
 		from State
 		ev   EventType
 	}{
-		{StatePending, EvLeaseOffered},   // 未就绪不可派租
-		{StatePending, EvStarted},        // 未执行不可启动
-		{StateReady, EvStarted},          // 跳过租约直接启动
-		{StateReady, EvCompleted},        // 未运行不可完成
-		{StateOffered, EvStarted},        // 未确认租约不可启动
-		{StateWaiting, EvCompleted},      // 挂起中不可直接完成（须先唤醒）
-		{StateWaiting, EvLeaseOffered},   // 挂起中须唤醒回 READY 再调度
-		{StateBlocked, EvCompleted},      // 阻塞中须先获决策
-		{StateBlocked, EvSuspended},      // 阻塞与挂起不可互换
-		{StateLeased, EvCompleted},       // 未 started 不可完成
+		{StatePending, EvLeaseOffered}, // 未就绪不可派租
+		{StatePending, EvStarted},      // 未执行不可启动
+		{StateReady, EvStarted},        // 跳过租约直接启动
+		{StateReady, EvCompleted},      // 未运行不可完成
+		{StateOffered, EvStarted},      // 未确认租约不可启动
+		{StateWaiting, EvCompleted},    // 挂起中不可直接完成（须先唤醒）
+		{StateWaiting, EvLeaseOffered}, // 挂起中须唤醒回 READY 再调度
+		{StateBlocked, EvCompleted},    // 阻塞中须先获决策
+		{StateBlocked, EvSuspended},    // 阻塞与挂起不可互换
+		{StateLeased, EvCompleted},     // 未 started 不可完成
 	}
 	for _, c := range cases {
 		if _, err := Apply(c.from, c.ev); err == nil {

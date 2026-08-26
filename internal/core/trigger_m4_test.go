@@ -79,6 +79,37 @@ func TestEventWakeWhereFilter(t *testing.T) {
 	}
 }
 
+func TestEventWakePaginatesPastFirstBatch(t *testing.T) {
+	s, st, clk := newService()
+	mustRegister(t, s, "agt_a", 1)
+	m, _ := s.CreateMission(ctx, "u1", "event pagination", []TaskSpec{
+		{Name: "waiter", Kind: mission.KindAgent},
+	})
+	waiter, token := startOne(t, s, "agt_a")
+	ttl := clk.Now().Add(time.Hour)
+	if _, err := s.Suspend(ctx, waiter.ID, token, waiter.Version, "agt_a",
+		&mission.WakeSpec{Kind: mission.WakeEvent, Deadline: &ttl,
+			Event: &mission.EventMatch{Types: []string{"target"}}}, nil); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	for i := 0; i < 205; i++ {
+		typ := "noise"
+		if i == 204 {
+			typ = "target"
+		}
+		if err := st.AppendEvent(ctx, &store.Event{AggregateID: waiter.ID, MissionID: m.ID,
+			Type: typ, Actor: store.Actor{Kind: "system", ID: "test"}, Ts: clk.Now()}); err != nil {
+			t.Fatalf("AppendEvent: %v", err)
+		}
+	}
+	if err := s.SweepOnce(ctx); err != nil {
+		t.Fatalf("SweepOnce: %v", err)
+	}
+	if got := mustGet(t, s, m.ID, waiter.ID); got.State != mission.StateReady {
+		t.Fatalf("target after page boundary did not wake task: %s", got.State)
+	}
+}
+
 func TestMatchWhere(t *testing.T) {
 	payload := map[string]any{"issue_id": "123", "meta": map[string]any{"prio": float64(2)}}
 	if !matchWhere(payload, map[string]any{"issue_id": "123"}) {

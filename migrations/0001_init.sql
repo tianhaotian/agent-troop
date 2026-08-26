@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     mission_id      TEXT NOT NULL REFERENCES missions(id),
     subtask_id      TEXT REFERENCES subtasks(id),
     decider_type    TEXT NOT NULL,               -- human | agent
-    decider_id      TEXT NOT NULL,
+	decider_id      TEXT,                        -- pending 工单尚无裁决者
     question        TEXT NOT NULL,
     options         JSONB NOT NULL DEFAULT '[]',
     choice          TEXT,

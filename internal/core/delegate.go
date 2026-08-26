@@ -21,19 +21,21 @@ const IntentDelegate = "delegate"
 
 // DelegateSpec delegate 的子女任务声明（TaskSpec 的子集 + rework 链）。
 type DelegateSpec struct {
-	Name           string         `json:"name,omitempty"` // 缺省平台生成
-	RequiredSkills []string       `json:"required_skills,omitempty"`
-	Input          map[string]any `json:"input,omitempty"`
-	Priority       int            `json:"priority,omitempty"`
-	Deadline       *time.Time     `json:"deadline,omitempty"`
-	MaxAttempts    int            `json:"max_attempts,omitempty"`
+	Name           string                     `json:"name,omitempty"` // 缺省平台生成
+	RequiredSkills []string                   `json:"required_skills,omitempty"`
+	Input          map[string]any             `json:"input,omitempty"`
+	Priority       int                        `json:"priority,omitempty"`
+	Deadline       *time.Time                 `json:"deadline,omitempty"`
+	MaxAttempts    int                        `json:"max_attempts,omitempty"`
+	BudgetTokens   int64                      `json:"budget_tokens,omitempty"` // Mission 账户中的原子预占切片
+	Grants         mission.PermissionEnvelope `json:"grants,omitempty"`
 	// rework（M6-K2）：对 Lead 自己派生的子女验收不通过时的链式重派
 	ReworkOf string `json:"rework_of,omitempty"`
 	Feedback string `json:"feedback,omitempty"` // 结构化反馈，入子女 input.feedback
 }
 
 // intentDelegate 委托编排水线：core 校验（父任务/Mission/depth/fanout/rework 链，
-// 早失败不耗键）→ store.SpawnSubtask 原子落库 → 子女推进 READY。
+// 早失败不耗键）→ store.SpawnSubtask 原子落库并推进 READY。
 func (s *Service) intentDelegate(ctx context.Context, in Intent) (*IntentResult, error) {
 	if in.IdempotencyKey == "" {
 		return nil, fmt.Errorf("core: delegate intent requires idempotency_key")
@@ -41,9 +43,22 @@ func (s *Service) intentDelegate(ctx context.Context, in Intent) (*IntentResult,
 	if in.ParentSubtaskID == "" || in.Task == nil {
 		return nil, fmt.Errorf("core: delegate intent requires parent_subtask_id and task")
 	}
+	if in.Source.Kind != "agent" {
+		return nil, fmt.Errorf("%w: delegate requires an agent source", ErrForbidden)
+	}
+	if in.Task.BudgetTokens < 0 {
+		return nil, fmt.Errorf("%w: task.budget_tokens must be >= 0", ErrInvalidBudget)
+	}
+	grants, err := mission.NormalizePermissionEnvelope(in.Task.Grants)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPermission, err)
+	}
 	// 父任务须 RUNNING（委托发生于 Lead 执行中）；找不到即非 RUNNING 或不存在
 	parent, err := s.findRunning(ctx, in.ParentSubtaskID)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := s.authorizeSubtaskLeaseOwner(ctx, parent.ID, in.FencingToken, in.Source.ID, true); err != nil {
 		return nil, err
 	}
 	m, err := s.st.GetMission(ctx, parent.MissionID)
@@ -52,6 +67,9 @@ func (s *Service) intentDelegate(ctx context.Context, in Intent) (*IntentResult,
 	}
 	if m.Status != mission.MissionActive {
 		return nil, fmt.Errorf("core: delegate into terminal mission %s rejected", m.Status)
+	}
+	if !mission.PermissionEnvelopeSubset(parent.Grants, grants) {
+		return nil, fmt.Errorf("%w: delegated grants exceed parent envelope", ErrInvalidPermission)
 	}
 	subs, err := s.st.ListSubtasks(ctx, parent.MissionID)
 	if err != nil {
@@ -68,8 +86,11 @@ func (s *Service) intentDelegate(ctx context.Context, in Intent) (*IntentResult,
 		RequiredSkills: in.Task.RequiredSkills,
 		Input:          in.Task.Input,
 		ReworkOf:       in.Task.ReworkOf,
-		Scheduling:     mission.SchedulingSpec{Priority: in.Task.Priority, Deadline: in.Task.Deadline},
-		Retry:          mission.RetryPolicy{MaxAttempts: in.Task.MaxAttempts, OnFailure: "retry"},
+		Grants:         grants,
+		Scheduling: mission.SchedulingSpec{
+			Priority: in.Task.Priority, Deadline: in.Task.Deadline, BudgetTokens: in.Task.BudgetTokens,
+		},
+		Retry: mission.RetryPolicy{MaxAttempts: in.Task.MaxAttempts, OnFailure: "retry"},
 	}
 	if in.Task.Name != "" {
 		child.ID = subID(parent.MissionID, in.Task.Name) // 与 Mission 创建命名一致
@@ -90,11 +111,7 @@ func (s *Service) intentDelegate(ctx context.Context, in Intent) (*IntentResult,
 	if err != nil {
 		return nil, err
 	}
-	// 子女无 DAG 依赖：即建即 READY（委托关系由 parent_id 表达，M6 §3.2）
-	if _, err := s.st.TransitionSubtask(ctx, child.ID, mission.EvDepsSatisfied, 0,
-		store.Actor{Kind: "system", ID: "orchestrator"}, nil, s.clk.Now(), nil); err != nil {
-		return nil, fmt.Errorf("activate delegated subtask: %w", err)
-	}
+	// SpawnSubtask 在同一事务内创建并激活子女，避免 PENDING 孤儿窗口。
 	return &IntentResult{MissionID: parent.MissionID, SubtaskID: child.ID}, nil
 }
 

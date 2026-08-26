@@ -207,13 +207,13 @@ func TestProgressCheckpoint(t *testing.T) {
 		{Name: "long", Kind: mission.KindAgent, RequiredSkills: []string{"web.research"}},
 	})
 	sub, token := startOne(t, s, "agt_a")
-	if err := s.Progress(ctx, sub.ID, sub.LeaseID, token, json.RawMessage(`{"step": 3}`)); err != nil {
+	if err := s.Progress(ctx, sub.ID, sub.LeaseID, token, "agt_a", json.RawMessage(`{"step": 3}`)); err != nil {
 		t.Fatalf("Progress: %v", err)
 	}
 	if cur := mustGet(t, s, m.ID, sub.ID); string(cur.Checkpoint) != `{"step": 3}` {
 		t.Fatalf("checkpoint = %s", cur.Checkpoint)
 	}
-	if err := s.Progress(ctx, sub.ID, sub.LeaseID, token+1, json.RawMessage(`{"step": 4}`)); !errors.Is(err, store.ErrFenced) {
+	if err := s.Progress(ctx, sub.ID, sub.LeaseID, token+1, "agt_a", json.RawMessage(`{"step": 4}`)); !errors.Is(err, store.ErrFenced) {
 		t.Fatalf("bad token must fence, got %v", err)
 	}
 }
