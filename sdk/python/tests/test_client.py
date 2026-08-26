@@ -52,6 +52,22 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(client.calls[-1][1].split("/")[-1], "fail")
         self.assertEqual(client.calls[-1][2]["reason"], "runtime failed")
 
+    def test_quality_reputation_and_usage_methods(self):
+        client = FakeClient()
+        client.verify_artifact("art/1", score=0.8, confidence=0.9,
+                               verdict="accepted", verifier_agent_id="judge")
+        method, path, body = client.calls[-1]
+        self.assertEqual((method, path), ("POST", "/v1/artifacts/art/1/verify"))
+        self.assertEqual(body["verifier_agent_id"], "judge")
+        client.artifact_quality("art/1")
+        self.assertEqual(client.calls[-1][1], "/v1/artifacts/art/1/quality")
+        client.reputation("agt/1")
+        self.assertEqual(client.calls[-1][1], "/v1/agents/agt/1/reputation")
+        client.mission_usage("msn/1")
+        self.assertEqual(client.calls[-1][1], "/v1/missions/msn/1/usage")
+        client.observability_snapshot()
+        self.assertEqual(client.calls[-1][1], "/v1/observability/snapshot")
+
 
 if __name__ == "__main__":
     unittest.main()

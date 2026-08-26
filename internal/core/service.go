@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"agenttroop/internal/clock"
@@ -18,10 +19,11 @@ import (
 
 // Config 服务参数。
 type Config struct {
-	OfferTTL         time.Duration // OFFERED 租约寿命（Agent 须在此时间内 accept）
-	ScheduleBatch    int           // 单轮调度拉取的就绪任务数
-	HeartbeatStale   time.Duration // 超过该时长无心跳标记 suspect
-	LeadHeartbeatTTL time.Duration // Lead snapshot heartbeat 续租窗口（§15.2）
+	OfferTTL           time.Duration // OFFERED 租约寿命（Agent 须在此时间内 accept）
+	ScheduleBatch      int           // 单轮调度拉取的就绪任务数
+	HeartbeatStale     time.Duration // 超过该时长无心跳标记 suspect
+	LeadHeartbeatTTL   time.Duration // Lead snapshot heartbeat 续租窗口（§15.2）
+	ReputationCacheTTL time.Duration // Scheduler 信誉快照缓存（§19.3）
 	// 主子委托（M6，§15.1 结构校验）
 	MaxDelegateDepth  int // 委托链最大深度（沿 parent_id 上溯）
 	MaxDelegateFanout int // 单父任务最大直接子女数
@@ -30,24 +32,30 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{OfferTTL: 30 * time.Second, ScheduleBatch: 100, HeartbeatStale: 90 * time.Second,
-		LeadHeartbeatTTL: 60 * time.Second,
+		LeadHeartbeatTTL: 60 * time.Second, ReputationCacheTTL: 5 * time.Second,
 		MaxDelegateDepth: 4, MaxDelegateFanout: 8, MaxRework: 3}
 }
 
 type Service struct {
-	st       store.Store
-	clk      clock.Clock
-	cfg      Config
-	blob     BlobStore
-	strategy PlacementStrategy
+	st              store.Store
+	clk             clock.Clock
+	cfg             Config
+	blob            BlobStore
+	strategy        PlacementStrategy
+	reputationMu    sync.Mutex
+	reputationCache map[string]reputationCacheEntry
 }
 
 func New(st store.Store, clk clock.Clock, cfg Config) *Service {
-	return &Service{st: st, clk: clk, cfg: cfg, blob: NewMemBlob(), strategy: CapabilityFirst{}}
+	return &Service{st: st, clk: clk, cfg: cfg, blob: NewMemBlob(), strategy: CapabilityFirst{},
+		reputationCache: map[string]reputationCacheEntry{}}
 }
 
 // Ready 验证服务处理流量所需的存储依赖可用。
 func (s *Service) Ready(ctx context.Context) error { return s.st.Ping(ctx) }
+
+// Now exposes the injected logical clock to protocol-boundary instrumentation.
+func (s *Service) Now() time.Time { return s.clk.Now() }
 
 // WithStrategy 替换放置策略（M3-T1；cmd/troopd 由 TROOP_SCHEDULER 解析）。
 func (s *Service) WithStrategy(ps PlacementStrategy) *Service {
@@ -526,13 +534,20 @@ func (s *Service) CompleteSubtaskWithUsage(ctx context.Context, subtaskID string
 	}
 	// 幂等重放发生时租约已 RELEASED，因此只校验不可变的 owner/subtask/token 绑定；
 	// Store 继续以“幂等键优先”决定是重放还是要求 ACTIVE 租约。
-	if _, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, false); err != nil {
+	current, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, false)
+	if err != nil {
 		return nil, err
+	}
+	lease, _ := s.st.GetLease(ctx, current.LeaseID)
+	latencyMS := float64(0)
+	if lease != nil && !lease.CreatedAt.IsZero() {
+		latencyMS = float64(s.clk.Now().Sub(lease.CreatedAt).Milliseconds())
 	}
 	actor := store.Actor{Kind: "agent", ID: agentID}
 	sub, err := s.st.CompleteSubtaskWithUsage(ctx, subtaskID, fencingToken, idemKey, resultRef,
 		usageTokens, version, actor, s.clk.Now())
 	if errors.Is(err, store.ErrDuplicate) && sub != nil && sub.State == mission.StateSucceeded {
+		s.recordOutcome(ctx, sub, true, agentID, latencyMS)
 		if propErr := s.propagate(ctx, sub, actor); propErr != nil {
 			return sub, fmt.Errorf("reconcile duplicate completion: %w", propErr)
 		}
@@ -544,13 +559,20 @@ func (s *Service) CompleteSubtaskWithUsage(ctx context.Context, subtaskID string
 	if err := s.propagate(ctx, sub, actor); err != nil {
 		return sub, fmt.Errorf("propagate: %w", err)
 	}
+	s.recordOutcome(ctx, sub, true, agentID, latencyMS)
 	return sub, nil
 }
 
 // FailSubtask 失败回调：按 retry 策略重试回 READY，否则推导 Mission 终态。
 func (s *Service) FailSubtask(ctx context.Context, subtaskID string, fencingToken int64, reason string, version int64, agentID string) (*mission.Subtask, error) {
-	if _, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, true); err != nil {
+	current, err := s.authorizeSubtaskLeaseOwner(ctx, subtaskID, fencingToken, agentID, true)
+	if err != nil {
 		return nil, err
+	}
+	lease, _ := s.st.GetLease(ctx, current.LeaseID)
+	latencyMS := float64(0)
+	if lease != nil && !lease.CreatedAt.IsZero() {
+		latencyMS = float64(s.clk.Now().Sub(lease.CreatedAt).Milliseconds())
 	}
 	actor := store.Actor{Kind: "agent", ID: agentID}
 	now := s.clk.Now()
@@ -558,6 +580,7 @@ func (s *Service) FailSubtask(ctx context.Context, subtaskID string, fencingToke
 	if err != nil {
 		return sub, err
 	}
+	s.recordOutcome(ctx, sub, false, agentID, latencyMS)
 	if sub.Attempt < sub.Retry.MaxAttempts {
 		// 可重试：回 READY，attempt+1（§5.4 指数退避在 M3 引入 jitter 时实现）
 		retried, err := s.st.TransitionSubtask(ctx, sub.ID, mission.EvRetried, sub.Version,
@@ -652,7 +675,23 @@ func (s *Service) SweepOnce(ctx context.Context) error {
 	if err := s.reconcileSucceeded(ctx); err != nil {
 		return err
 	}
+	if err := s.reconcileReputation(ctx); err != nil {
+		return err
+	}
 	return s.reconcileResolvedDecisions(ctx)
+}
+
+func (s *Service) reconcileReputation(ctx context.Context) error {
+	for _, state := range []mission.State{mission.StateSucceeded, mission.StateFailed} {
+		subs, err := s.st.ListSubtasksByState(ctx, state)
+		if err != nil {
+			return err
+		}
+		for _, sub := range subs {
+			s.recordOutcome(ctx, sub, state == mission.StateSucceeded, sub.Assignee, 0)
+		}
+	}
+	return nil
 }
 
 // reconcilePendingRoots 修复旧版本或异常中断遗留的无依赖 PENDING 根节点。

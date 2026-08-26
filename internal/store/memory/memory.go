@@ -8,6 +8,7 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -29,9 +30,13 @@ type Store struct {
 	board       map[string]*store.BoardEntry // missionID/ns/key
 	artifacts   map[string]*store.Artifact
 	leadInbox   map[string]*store.LeadInboxItem
-	budgets     map[string]*store.BudgetAccount  // by mission id; missing means unmetered
-	budgetHolds map[string]*store.BudgetHold     // by subtask id
-	contexts    map[string]*store.ContextPackage // by lease id
+	budgets     map[string]*store.BudgetAccount    // by mission id; missing means unmetered
+	budgetHolds map[string]*store.BudgetHold       // by subtask id
+	contexts    map[string]*store.ContextPackage   // by lease id
+	quality     map[string]*store.QualityRecord    // by artifact id
+	reputations map[string]*store.ReputationRecord // agent id + NUL + skill
+	repSignals  map[string]struct{}
+	meters      map[string]*store.MeterRecord
 
 	eventSeq   int64
 	fencingSeq int64
@@ -52,6 +57,10 @@ func New() *Store {
 		budgets:     map[string]*store.BudgetAccount{},
 		budgetHolds: map[string]*store.BudgetHold{},
 		contexts:    map[string]*store.ContextPackage{},
+		quality:     map[string]*store.QualityRecord{},
+		reputations: map[string]*store.ReputationRecord{},
+		repSignals:  map[string]struct{}{},
+		meters:      map[string]*store.MeterRecord{},
 	}
 }
 
@@ -272,8 +281,7 @@ func (s *Store) UpsertAgent(_ context.Context, a *store.Agent, now time.Time) er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a.LastHeartbeat = now
-	c := *a
-	s.agents[a.ID] = &c
+	s.agents[a.ID] = cloneAgent(a)
 	return nil
 }
 
@@ -284,8 +292,7 @@ func (s *Store) GetAgent(_ context.Context, id string) (*store.Agent, error) {
 	if !ok {
 		return nil, store.ErrNotFound
 	}
-	c := *a
-	return &c, nil
+	return cloneAgent(a), nil
 }
 
 func (s *Store) ListAgents(_ context.Context) ([]*store.Agent, error) {
@@ -293,11 +300,34 @@ func (s *Store) ListAgents(_ context.Context) ([]*store.Agent, error) {
 	defer s.mu.Unlock()
 	var out []*store.Agent
 	for _, a := range s.agents {
-		c := *a
-		out = append(out, &c)
+		out = append(out, cloneAgent(a))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+func cloneAgent(a *store.Agent) *store.Agent {
+	c := *a
+	c.Endpoint = cloneStringMap(a.Endpoint)
+	c.Capabilities = append([]store.Capability(nil), a.Capabilities...)
+	c.TriggerScopes = append([]string(nil), a.TriggerScopes...)
+	c.Reputation = map[string]*store.ReputationRecord{}
+	for skill, rep := range a.Reputation {
+		rc := *rep
+		c.Reputation[skill] = &rc
+	}
+	return &c
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func (s *Store) HeartbeatAgent(_ context.Context, id string, now time.Time) error {
@@ -323,6 +353,48 @@ func (s *Store) MarkAgentHealth(_ context.Context, id, health string) error {
 		return store.ErrNotFound
 	}
 	a.Health = health
+	return nil
+}
+
+func (s *Store) ListReputations(_ context.Context, agentID string) ([]*store.ReputationRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.agents[agentID]; !ok {
+		return nil, store.ErrNotFound
+	}
+	var out []*store.ReputationRecord
+	for _, rep := range s.reputations {
+		if rep.AgentID == agentID {
+			cp := *rep
+			cp.RefreshScores()
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Skill < out[j].Skill })
+	return out, nil
+}
+
+func (s *Store) ApplyReputationSignal(_ context.Context, sig store.ReputationSignal, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyReputationSignalLocked(sig, now)
+}
+
+func (s *Store) applyReputationSignalLocked(sig store.ReputationSignal, now time.Time) error {
+	if _, ok := s.repSignals[sig.ID]; ok {
+		return store.ErrDuplicate
+	}
+	if _, ok := s.agents[sig.AgentID]; !ok {
+		return store.ErrNotFound
+	}
+	key := sig.AgentID + "\x00" + sig.Skill
+	rep := s.reputations[key]
+	if rep == nil {
+		rep = store.NewReputation(sig.AgentID, sig.Skill)
+		s.reputations[key] = rep
+	}
+	store.ApplyReputationSignal(rep, sig, now)
+	s.repSignals[sig.ID] = struct{}{}
 	return nil
 }
 
@@ -357,6 +429,7 @@ func (s *Store) OfferLease(_ context.Context, subtaskID, agentID string, expecte
 		FencingToken: s.fencingSeq,
 		ExpiresAt:    now.Add(ttl),
 		State:        store.LeaseActive,
+		CreatedAt:    now,
 	}
 	pkg, err := s.buildContextPackageLocked(lease.ID, sub, now)
 	if err != nil {
@@ -623,6 +696,14 @@ func (s *Store) completeSubtask(id string, fencingToken int64, idemKey, resultRe
 	sub.ResultRef = resultRef
 	sub.Version++
 	s.idem[idemKey] = resultRef
+	s.putMeterLocked(&store.MeterRecord{ID: "meter:lease:" + l.ID, MissionID: sub.MissionID,
+		SubtaskID: sub.ID, AgentID: l.AgentID, Resource: "lease.wall_ms",
+		Quantity: float64(now.Sub(l.CreatedAt).Milliseconds()), Trust: store.MeterAuthoritative}, now)
+	if usageTokens > 0 {
+		s.putMeterLocked(&store.MeterRecord{ID: "meter:token:" + sub.ID + ":" + idemKey,
+			MissionID: sub.MissionID, SubtaskID: sub.ID, AgentID: l.AgentID,
+			Resource: "token.reported", Quantity: float64(usageTokens), Trust: store.MeterSelfReported}, now)
+	}
 	s.releaseLeaseLocked(l)
 	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvCompleted), map[string]any{
 		"state":      string(mission.StateSucceeded),
@@ -958,6 +1039,9 @@ func (s *Store) FailSubtask(_ context.Context, id string, fencingToken int64, re
 	}
 	sub.State = mission.StateFailed
 	sub.Version++
+	s.putMeterLocked(&store.MeterRecord{ID: "meter:lease:" + l.ID, MissionID: sub.MissionID,
+		SubtaskID: sub.ID, AgentID: l.AgentID, Resource: "lease.wall_ms",
+		Quantity: float64(now.Sub(l.CreatedAt).Milliseconds()), Trust: store.MeterAuthoritative}, now)
 	s.releaseLeaseLocked(l)
 	if sub.Attempt >= sub.Retry.MaxAttempts {
 		s.releaseBudgetHoldLocked(sub, "final_failure", actor, now)
@@ -1104,6 +1188,9 @@ func (s *Store) WakeSubtask(_ context.Context, id string, expectedVersion int64,
 	sub.State = mission.StateReady
 	sub.WakeKind, sub.WakeAt, sub.WakeDeadline, sub.WakeSpec = "", nil, nil, nil // 一次性注册，清空
 	sub.Version++
+	s.putMeterLocked(&store.MeterRecord{ID: "meter:wake:" + sub.ID + ":" + fmt.Sprint(sub.Version),
+		MissionID: sub.MissionID, SubtaskID: sub.ID, Resource: "wake.fire", Quantity: 1,
+		Trust: store.MeterAuthoritative}, now)
 	s.appendEventLocked(sub.ID, sub.MissionID, string(mission.EvWoken),
 		map[string]any{"state": string(mission.StateReady)}, actor, now)
 	c := *sub
@@ -1399,6 +1486,9 @@ func (s *Store) PutArtifact(_ context.Context, a *store.Artifact, now time.Time)
 	c := *a
 	c.CreatedAt = now
 	s.artifacts[a.ID] = &c
+	s.putMeterLocked(&store.MeterRecord{ID: "meter:artifact:" + a.ID, MissionID: a.MissionID,
+		SubtaskID: a.ProducedBy, Resource: "artifact.byte", Quantity: float64(a.Size),
+		Trust: store.MeterAuthoritative}, now)
 	s.appendEventLocked(a.ProducedBy, a.MissionID, "artifact.produced",
 		map[string]any{"artifact_id": a.ID, "sha256": a.SHA256, "size": a.Size},
 		store.Actor{Kind: "system", ID: "artifact-store"}, now)
@@ -1414,6 +1504,106 @@ func (s *Store) GetArtifact(_ context.Context, id string) (*store.Artifact, erro
 	}
 	c := *a
 	return &c, nil
+}
+
+func (s *Store) RecordQuality(_ context.Context, q *store.QualityRecord, signals []store.ReputationSignal,
+	actor store.Actor, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.artifacts[q.ArtifactID]; !ok {
+		return store.ErrNotFound
+	}
+	if _, ok := s.quality[q.ArtifactID]; ok {
+		return store.ErrDuplicate
+	}
+	for _, sig := range signals {
+		if _, ok := s.agents[sig.AgentID]; !ok {
+			return store.ErrNotFound
+		}
+	}
+	q.CreatedAt = now
+	cp, err := cloneQuality(q)
+	if err != nil {
+		return err
+	}
+	s.quality[q.ArtifactID] = cp
+	for _, sig := range signals {
+		if err := s.applyReputationSignalLocked(sig, now); err != nil && err != store.ErrDuplicate {
+			return err
+		}
+	}
+	s.putMeterLocked(&store.MeterRecord{ID: "meter:verify:" + q.ArtifactID, MissionID: q.MissionID,
+		SubtaskID: q.SubtaskID, Resource: "verify.call", Quantity: 1,
+		Trust: store.MeterAuthoritative}, now)
+	s.appendEventLocked(q.ArtifactID, q.MissionID, "artifact.verified", map[string]any{
+		"artifact_id": q.ArtifactID, "score": q.Score, "confidence": q.Confidence,
+		"verdict": q.Verdict, "failure_class": q.FailureClass,
+	}, actor, now)
+	return nil
+}
+
+func (s *Store) GetQuality(_ context.Context, artifactID string) (*store.QualityRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := s.quality[artifactID]
+	if q == nil {
+		return nil, store.ErrNotFound
+	}
+	return cloneQuality(q)
+}
+
+func cloneQuality(q *store.QualityRecord) (*store.QualityRecord, error) {
+	raw, err := json.Marshal(q)
+	if err != nil {
+		return nil, err
+	}
+	var cp store.QualityRecord
+	if err := json.Unmarshal(raw, &cp); err != nil {
+		return nil, err
+	}
+	return &cp, nil
+}
+
+func (s *Store) PutMeterRecord(_ context.Context, m *store.MeterRecord, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.meters[m.ID]; ok {
+		return store.ErrDuplicate
+	}
+	s.putMeterLocked(m, now)
+	return nil
+}
+
+func (s *Store) putMeterLocked(m *store.MeterRecord, now time.Time) {
+	if _, ok := s.meters[m.ID]; ok {
+		return
+	}
+	cp := *m
+	cp.RecordedAt = now
+	store.PriceMeter(&cp)
+	s.meters[m.ID] = &cp
+}
+
+func (s *Store) ListMeterRecords(_ context.Context, missionID string) ([]*store.MeterRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.missions[missionID]; !ok {
+		return nil, store.ErrNotFound
+	}
+	var out []*store.MeterRecord
+	for _, m := range s.meters {
+		if m.MissionID == missionID {
+			cp := *m
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RecordedAt.Equal(out[j].RecordedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].RecordedAt.Before(out[j].RecordedAt)
+	})
+	return out, nil
 }
 
 func (s *Store) appendEventLocked(aggregateID, missionID, typ string, payload map[string]any, actor store.Actor, now time.Time) {

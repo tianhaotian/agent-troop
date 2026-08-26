@@ -105,6 +105,31 @@ class Client:
                                "expires_in": expires_in})
         return urllib.parse.urljoin(self.base_url + "/", result["url"])
 
+    def verify_artifact(self, artifact_id: str, *, score: float, confidence: float,
+                        verdict: str, failure_class: str = "", rubric: str = "",
+                        context_hash: str = "", verifier_agent_id: str = "",
+                        layers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.request("POST",
+                            f"/v1/artifacts/{urllib.parse.quote(artifact_id)}/verify", {
+            "score": score, "confidence": confidence, "verdict": verdict,
+            "failure_class": failure_class, "rubric": rubric,
+            "context_hash": context_hash, "verifier_agent_id": verifier_agent_id,
+            "layers": layers or {},
+        })
+
+    def artifact_quality(self, artifact_id: str) -> Dict[str, Any]:
+        return self.request("GET",
+                            f"/v1/artifacts/{urllib.parse.quote(artifact_id)}/quality")
+
+    def reputation(self, agent_id: str) -> Dict[str, Any]:
+        return self.request("GET", f"/v1/agents/{urllib.parse.quote(agent_id)}/reputation")
+
+    def mission_usage(self, mission_id: str) -> Dict[str, Any]:
+        return self.request("GET", f"/v1/missions/{urllib.parse.quote(mission_id)}/usage")
+
+    def observability_snapshot(self) -> Dict[str, Any]:
+        return self.request("GET", "/v1/observability/snapshot")
+
 
 @dataclass
 class AgentWorker:

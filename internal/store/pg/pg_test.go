@@ -34,7 +34,8 @@ func testStore(t *testing.T) *Store {
 	applyMigrations(t, ctx, st)
 	// 清场（测试库专用！）
 	if _, err := st.pool.Exec(ctx,
-		`TRUNCATE missions, subtasks, agents, leases, artifacts, decisions, idempotency_keys,
+		`TRUNCATE quality_records, reputation_signals, reputations, meter_records,
+		 missions, subtasks, agents, leases, artifacts, decisions, idempotency_keys,
 		 events, board_entries, lead_inbox, budget_holds, mission_budgets, context_packages`); err != nil {
 		t.Fatalf("clean: %v", err)
 	}
@@ -64,6 +65,53 @@ func applyMigrations(t *testing.T, ctx context.Context, st *Store) {
 func TestPGMigrationsIdempotent(t *testing.T) {
 	st := testStore(t) // first application
 	applyMigrations(t, context.Background(), st)
+}
+
+func TestPGQualityReputationAndMetering(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 26, 16, 0, 0, 0, time.UTC)
+	actor := store.Actor{Kind: "service", ID: "judge"}
+	m := &mission.Mission{ID: "msn_m9_pg", Owner: "owner", Goal: "quality", Status: mission.MissionActive}
+	sub := &mission.Subtask{ID: "sub_m9_pg", MissionID: m.ID, Kind: mission.KindAgent,
+		State: mission.StateReady, RequiredSkills: []string{"write"}, Assignee: "agt_m9_pg"}
+	if err := st.CreateMission(ctx, m, []*mission.Subtask{sub}, actor, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAgent(ctx, &store.Agent{ID: "agt_m9_pg", Name: "writer", Platform: "custom",
+		Health: "healthy"}, now); err != nil {
+		t.Fatal(err)
+	}
+	artifact := &store.Artifact{ID: "art_m9_pg", SHA256: "abc", MissionID: m.ID,
+		ProducedBy: sub.ID, Size: 3}
+	if err := st.PutArtifact(ctx, artifact, now); err != nil {
+		t.Fatal(err)
+	}
+	success, quality := true, 0.81
+	record := &store.QualityRecord{ArtifactID: artifact.ID, MissionID: m.ID, SubtaskID: sub.ID,
+		ProducerAgentID: "agt_m9_pg", Score: 0.9, Confidence: 0.9,
+		Verdict: store.QualityAccepted, Layers: map[string]store.QualityLayer{"L0": {Pass: true}},
+		VerifiedBy: []store.Actor{actor}}
+	signal := store.ReputationSignal{ID: "quality:art_m9_pg:write", AgentID: "agt_m9_pg",
+		Skill: "write", Success: &success, Quality: &quality, Weight: 1}
+	if err := st.RecordQuality(ctx, record, []store.ReputationSignal{signal}, actor, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordQuality(ctx, record, nil, actor, now); !errors.Is(err, store.ErrDuplicate) {
+		t.Fatalf("duplicate=%v", err)
+	}
+	got, err := st.GetQuality(ctx, artifact.ID)
+	if err != nil || got.Verdict != store.QualityAccepted || !got.Layers["L0"].Pass {
+		t.Fatalf("quality=%+v err=%v", got, err)
+	}
+	reps, err := st.ListReputations(ctx, "agt_m9_pg")
+	if err != nil || len(reps) != 1 || reps[0].Skill != "write" || reps[0].Samples != 1 {
+		t.Fatalf("reputations=%+v err=%v", reps, err)
+	}
+	meters, err := st.ListMeterRecords(ctx, m.ID)
+	if err != nil || len(meters) != 2 {
+		t.Fatalf("meters=%+v err=%v", meters, err)
+	}
 }
 
 func TestPGBudgetHoldLifecycle(t *testing.T) {

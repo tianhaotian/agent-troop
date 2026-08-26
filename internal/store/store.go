@@ -62,6 +62,8 @@ type Agent struct {
 	TriggerScopes []string `json:"trigger_scopes,omitempty"`
 	// AuthSubject 是外部身份令牌的稳定 subject。为空时兼容地回退为 Agent ID。
 	AuthSubject string `json:"auth_subject,omitempty"`
+	// Reputation 是调度查询时装载的按 skill 信誉快照，不由注册请求覆盖。
+	Reputation map[string]*ReputationRecord `json:"reputation,omitempty"`
 }
 
 // Lease 执行租约（§4.3：fencing token 单调递增防僵尸写入）。
@@ -72,6 +74,7 @@ type Lease struct {
 	FencingToken int64     `json:"fencing_token"`
 	ExpiresAt    time.Time `json:"expires_at"`
 	State        string    `json:"state"` // ACTIVE | EXPIRED | RELEASED | FENCED
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 const (
@@ -269,6 +272,8 @@ type Store interface {
 	ListAgents(ctx context.Context) ([]*Agent, error)
 	HeartbeatAgent(ctx context.Context, id string, now time.Time) error
 	MarkAgentHealth(ctx context.Context, id, health string) error
+	ListReputations(ctx context.Context, agentID string) ([]*ReputationRecord, error)
+	ApplyReputationSignal(ctx context.Context, sig ReputationSignal, now time.Time) error
 
 	// ---- 租约（fencing） ----
 	// OfferLease 原子完成：READY→OFFERED 迁移 + 租约插入（fencing token 取全局单调序列）。
@@ -385,4 +390,10 @@ type Store interface {
 	// ---- Artifact（M2） ----
 	PutArtifact(ctx context.Context, a *Artifact, now time.Time) error
 	GetArtifact(ctx context.Context, id string) (*Artifact, error)
+	RecordQuality(ctx context.Context, q *QualityRecord, signals []ReputationSignal, actor Actor, now time.Time) error
+	GetQuality(ctx context.Context, artifactID string) (*QualityRecord, error)
+
+	// ---- 权威计量（M9） ----
+	PutMeterRecord(ctx context.Context, m *MeterRecord, now time.Time) error
+	ListMeterRecords(ctx context.Context, missionID string) ([]*MeterRecord, error)
 }

@@ -69,6 +69,9 @@ func routeAllowed(identity auth.Identity, r *http.Request) bool {
 	if p == "/v1/agents/register" || strings.HasSuffix(p, "/wake") {
 		return false
 	}
+	if strings.HasPrefix(p, "/v1/artifacts/") && strings.HasSuffix(p, "/verify") {
+		return true // handler enforces stable verifier identity and producer isolation
+	}
 	if strings.HasPrefix(p, "/v1/agents/") || strings.HasPrefix(p, "/v1/leases/") ||
 		strings.HasPrefix(p, "/v1/subtasks/") || p == "/v1/intents" || p == "/v1/artifacts" ||
 		strings.HasSuffix(p, "/signed-url") {

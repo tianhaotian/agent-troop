@@ -51,7 +51,40 @@ func (CapabilityFirst) Score(sub *mission.Subtask, a *store.Agent, now time.Time
 		return 0, false
 	}
 	level, _ := matchSkills(a, sub.RequiredSkills)
-	return level - loadPenalty(sub, now)*float64(a.Running), true
+	reputation, samples := reputationScore(a, sub.RequiredSkills)
+	exploration := 0.0
+	if samples < 5 {
+		exploration = 0.05 * (1 - samples/5) // 有界冷启动探索，不压过能力硬约束
+	}
+	return level + 0.3*reputation + exploration - loadPenalty(sub, now)*float64(a.Running), true
+}
+
+func reputationScore(a *store.Agent, skills []string) (float64, float64) {
+	if len(skills) == 0 {
+		skills = []string{"*"}
+	}
+	score, samples := 1.0, math.MaxFloat64
+	for _, skill := range skills {
+		r := a.Reputation[skill]
+		if r == nil {
+			if 0.5 < score {
+				score = 0.5
+			}
+			samples = 0
+			continue
+		}
+		r.RefreshScores()
+		if r.CompositeScore < score {
+			score = r.CompositeScore
+		}
+		if r.Samples < samples {
+			samples = r.Samples
+		}
+	}
+	if samples == math.MaxFloat64 {
+		samples = 0
+	}
+	return score, samples
 }
 
 // loadPenalty 基础 0.1，按优先级与 deadline 紧迫度放大（最高 ×3）。
@@ -111,8 +144,18 @@ func (s *Service) ScheduleOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	sort.Slice(agents, func(i, j int) bool { return agents[i].ID < agents[j].ID }) // 确定性打分次序
 	now := s.clk.Now()
+	for _, agent := range agents {
+		reps, err := s.cachedReputations(ctx, agent.ID, now)
+		if err != nil {
+			return 0, err
+		}
+		agent.Reputation = make(map[string]*store.ReputationRecord, len(reps))
+		for _, rep := range reps {
+			agent.Reputation[rep.Skill] = rep
+		}
+	}
+	sort.Slice(agents, func(i, j int) bool { return agents[i].ID < agents[j].ID }) // 确定性打分次序
 	placed := 0
 	for _, sub := range ready {
 		if isHumanKind(sub.Kind) {

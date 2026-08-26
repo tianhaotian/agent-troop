@@ -18,14 +18,15 @@ import (
 )
 
 type Server struct {
-	svc  *core.Service
-	auth *auth.Manager
+	svc     *core.Service
+	auth    *auth.Manager
+	metrics *httpMetrics
 }
 
-func New(svc *core.Service) *Server { return &Server{svc: svc} }
+func New(svc *core.Service) *Server { return &Server{svc: svc, metrics: newHTTPMetrics()} }
 
 func NewAuthenticated(svc *core.Service, manager *auth.Manager) *Server {
-	return &Server{svc: svc, auth: manager}
+	return &Server{svc: svc, auth: manager, metrics: newHTTPMetrics()}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -43,6 +44,7 @@ func (s *Server) Handler() http.Handler {
 	mux.handle("POST /v1/missions", s.createMission)
 	mux.handle("GET /v1/missions/{id}", s.getMission)
 	mux.handle("GET /v1/missions/{id}/budget", s.getMissionBudget)
+	mux.handle("GET /v1/missions/{id}/usage", s.getUsage)
 	mux.handle("POST /v1/missions/{id}/cancel", s.cancelMission)
 	mux.handle("GET /v1/missions/{id}/events", s.missionEventsSSE)
 
@@ -50,6 +52,7 @@ func (s *Server) Handler() http.Handler {
 	mux.handle("POST /v1/agents/register", s.registerAgent)
 	mux.handle("POST /v1/agents/{id}/heartbeat", s.heartbeat)
 	mux.handle("GET /v1/agents/{id}/offers", s.listOffers)
+	mux.handle("GET /v1/agents/{id}/reputation", s.getReputation)
 
 	// 执行面（Agent 回调）
 	mux.handle("POST /v1/leases/{id}/accept", s.acceptLease)
@@ -81,13 +84,19 @@ func (s *Server) Handler() http.Handler {
 	mux.handle("GET /v1/artifacts/{id}", s.getArtifact)
 	mux.handle("GET /v1/artifacts/{id}/content", s.getArtifactContent)
 	mux.handle("POST /v1/artifacts/{id}/signed-url", s.signArtifactURL)
+	mux.handle("POST /v1/artifacts/{id}/verify", s.verifyArtifact)
+	mux.handle("GET /v1/artifacts/{id}/quality", s.getQuality)
+
+	// 运行观测（M9）
+	mux.handle("GET /v1/observability/snapshot", s.observabilitySnapshot)
+	mux.handle("GET /metrics", s.prometheusMetrics)
 
 	// 触发准入（M4-G3）
 	mux.handle("POST /v1/intents", s.submitIntent)
 
 	// 最小 Console（S11）
 	mux.handle("GET /", s.console)
-	return s.authenticate(mux)
+	return s.observe(s.authenticate(mux))
 }
 
 // ---- helpers ----
@@ -108,6 +117,10 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "fenced: stale fencing token"})
 	case errors.Is(err, core.ErrInvalidDAG):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, core.ErrInvalidQuality):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, store.ErrDuplicate):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "duplicate: " + err.Error()})
 	case errors.Is(err, core.ErrInvalidCondition):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()}) // M5：CEL 注册校验
 	case errors.Is(err, core.ErrInvalidLeadInput):

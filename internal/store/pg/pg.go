@@ -534,6 +534,92 @@ func (s *Store) MarkAgentHealth(ctx context.Context, id, health string) error {
 	return nil
 }
 
+func (s *Store) ListReputations(ctx context.Context, agentID string) ([]*store.ReputationRecord, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agents WHERE id=$1)`, agentID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, store.ErrNotFound
+	}
+	rows, err := s.pool.Query(ctx, `SELECT agent_id, skill, success_alpha, success_beta,
+		quality_ewma, quality_samples, reliability_alpha, reliability_beta,
+		latency_ewma_ms, cost_efficiency, samples, updated_at
+		FROM reputations WHERE agent_id=$1 ORDER BY skill`, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*store.ReputationRecord
+	for rows.Next() {
+		r, err := scanReputation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func scanReputation(row pgx.Row) (*store.ReputationRecord, error) {
+	var r store.ReputationRecord
+	if err := row.Scan(&r.AgentID, &r.Skill, &r.SuccessAlpha, &r.SuccessBeta,
+		&r.QualityEWMA, &r.QualitySamples, &r.ReliabilityAlpha, &r.ReliabilityBeta,
+		&r.LatencyEWMAms, &r.CostEfficiency, &r.Samples, &r.UpdatedAt); err != nil {
+		return nil, err
+	}
+	r.RefreshScores()
+	return &r, nil
+}
+
+func (s *Store) ApplyReputationSignal(ctx context.Context, sig store.ReputationSignal, now time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := applyReputationSignalTx(ctx, tx, sig, now); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func applyReputationSignalTx(ctx context.Context, tx pgx.Tx, sig store.ReputationSignal, now time.Time) error {
+	payload, err := js(sig)
+	if err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO reputation_signals
+		(id, agent_id, skill, signal, event_ref, created_at) VALUES ($1,$2,$3,$4,$5,$6)
+		ON CONFLICT (id) DO NOTHING`, sig.ID, sig.AgentID, sig.Skill, payload, sig.EventRef, now)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrDuplicate
+	}
+	r, err := scanReputation(tx.QueryRow(ctx, `SELECT agent_id, skill, success_alpha, success_beta,
+		quality_ewma, quality_samples, reliability_alpha, reliability_beta,
+		latency_ewma_ms, cost_efficiency, samples, updated_at
+		FROM reputations WHERE agent_id=$1 AND skill=$2 FOR UPDATE`, sig.AgentID, sig.Skill))
+	if errors.Is(err, pgx.ErrNoRows) {
+		r = store.NewReputation(sig.AgentID, sig.Skill)
+	} else if err != nil {
+		return err
+	}
+	store.ApplyReputationSignal(r, sig, now)
+	_, err = tx.Exec(ctx, `INSERT INTO reputations
+		(agent_id, skill, success_alpha, success_beta, quality_ewma, quality_samples,
+		reliability_alpha, reliability_beta, latency_ewma_ms, cost_efficiency, samples, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT (agent_id, skill) DO UPDATE SET success_alpha=$3, success_beta=$4,
+		quality_ewma=$5, quality_samples=$6, reliability_alpha=$7, reliability_beta=$8,
+		latency_ewma_ms=$9, cost_efficiency=$10, samples=$11, updated_at=$12`,
+		r.AgentID, r.Skill, r.SuccessAlpha, r.SuccessBeta, r.QualityEWMA, r.QualitySamples,
+		r.ReliabilityAlpha, r.ReliabilityBeta, r.LatencyEWMAms, r.CostEfficiency, r.Samples, r.UpdatedAt)
+	return err
+}
+
 // ---- 租约 ----
 
 func (s *Store) OfferLease(ctx context.Context, subtaskID, agentID string, expectedVersion int64,
@@ -566,13 +652,13 @@ func (s *Store) OfferLease(ctx context.Context, subtaskID, agentID string, expec
 	}
 	err = tx.QueryRow(ctx,
 		`INSERT INTO leases (id, subtask_id, agent_id, fencing_token, expires_at, state, created_at)
-		 VALUES ('les_' || $1, $2, $3, $4, $5, 'ACTIVE', $5) RETURNING id`,
-		fmt.Sprintf("%012d", fence), subtaskID, agentID, fence, now.Add(ttl)).Scan(&lease.ID)
+		 VALUES ('les_' || $1, $2, $3, $4, $5, 'ACTIVE', $6) RETURNING id`,
+		fmt.Sprintf("%012d", fence), subtaskID, agentID, fence, now.Add(ttl), now).Scan(&lease.ID)
 	if err != nil {
 		return nil, store.ErrConflict // 唯一部分索引：已有活跃租约
 	}
 	lease.SubtaskID, lease.AgentID, lease.FencingToken = subtaskID, agentID, fence
-	lease.ExpiresAt, lease.State = now.Add(ttl), store.LeaseActive
+	lease.ExpiresAt, lease.State, lease.CreatedAt = now.Add(ttl), store.LeaseActive, now
 
 	sub.State = mission.StateOffered
 	sub.Assignee = agentID
@@ -826,8 +912,8 @@ func (s *Store) AcceptLease(ctx context.Context, leaseID string, fencingToken in
 func (s *Store) GetLease(ctx context.Context, id string) (*store.Lease, error) {
 	var l store.Lease
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, subtask_id, agent_id, fencing_token, expires_at, state FROM leases WHERE id=$1`, id).
-		Scan(&l.ID, &l.SubtaskID, &l.AgentID, &l.FencingToken, &l.ExpiresAt, &l.State)
+		`SELECT id, subtask_id, agent_id, fencing_token, expires_at, state, created_at FROM leases WHERE id=$1`, id).
+		Scan(&l.ID, &l.SubtaskID, &l.AgentID, &l.FencingToken, &l.ExpiresAt, &l.State, &l.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -980,6 +1066,16 @@ func (s *Store) CompleteSubtaskWithUsage(ctx context.Context, id string, fencing
 		`INSERT INTO idempotency_keys (key, result, created_at) VALUES ($1,$2,$3)`,
 		idemKey, resultRef, now); err != nil {
 		return nil, err
+	}
+	if err := recordLeaseMeter(ctx, tx, sub, actor.ID, now); err != nil {
+		return nil, err
+	}
+	if usageTokens > 0 {
+		if err := putMeterTx(ctx, tx, &store.MeterRecord{ID: "meter:token:" + sub.ID + ":" + idemKey,
+			MissionID: sub.MissionID, SubtaskID: sub.ID, AgentID: actor.ID,
+			Resource: "token.reported", Quantity: float64(usageTokens), Trust: store.MeterSelfReported}, now); err != nil {
+			return nil, err
+		}
 	}
 	if err := releaseLease(ctx, tx, sub.LeaseID); err != nil {
 		return nil, err
@@ -1477,6 +1573,9 @@ func (s *Store) FailSubtask(ctx context.Context, id string, fencingToken int64, 
 	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
 		return nil, err
 	}
+	if err := recordLeaseMeter(ctx, tx, sub, actor.ID, now); err != nil {
+		return nil, err
+	}
 	if err := releaseLease(ctx, tx, leaseID); err != nil {
 		return nil, err
 	}
@@ -1628,6 +1727,11 @@ func (s *Store) WakeSubtask(ctx context.Context, id string, expectedVersion int6
 	sub.State = mission.StateReady
 	sub.WakeKind, sub.WakeAt, sub.WakeDeadline, sub.WakeSpec = "", nil, nil, nil // 一次性注册，清空
 	if err := updateSubtask(ctx, tx, sub, expectedVersion, now); err != nil {
+		return nil, err
+	}
+	if err := putMeterTx(ctx, tx, &store.MeterRecord{ID: fmt.Sprintf("meter:wake:%s:%d", sub.ID, expectedVersion+1),
+		MissionID: sub.MissionID, SubtaskID: sub.ID, Resource: "wake.fire", Quantity: 1,
+		Trust: store.MeterAuthoritative}, now); err != nil {
 		return nil, err
 	}
 	if err := appendEvent(ctx, tx, &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID,
@@ -2075,6 +2179,11 @@ func (s *Store) PutArtifact(ctx context.Context, a *store.Artifact, now time.Tim
 		a.ID, a.SHA256, "blob://"+a.SHA256, a.SchemaRef, a.ProducedBy, a.MissionID, a.Size, now); err != nil {
 		return store.ErrConflict
 	}
+	if err := putMeterTx(ctx, tx, &store.MeterRecord{ID: "meter:artifact:" + a.ID,
+		MissionID: a.MissionID, SubtaskID: a.ProducedBy, Resource: "artifact.byte",
+		Quantity: float64(a.Size), Trust: store.MeterAuthoritative}, now); err != nil {
+		return err
+	}
 	ev := &store.Event{AggregateID: a.ProducedBy, MissionID: a.MissionID, Type: "artifact.produced",
 		Payload: map[string]any{"artifact_id": a.ID, "sha256": a.SHA256, "size": a.Size},
 		Actor:   store.Actor{Kind: "system", ID: "artifact-store"}, Ts: now}
@@ -2101,6 +2210,163 @@ func (s *Store) GetArtifact(ctx context.Context, id string) (*store.Artifact, er
 		a.SchemaRef = *schemaRef
 	}
 	return &a, err
+}
+
+func (s *Store) RecordQuality(ctx context.Context, q *store.QualityRecord, signals []store.ReputationSignal,
+	actor store.Actor, now time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	layers, _ := js(q.Layers)
+	verifiedBy, _ := js(q.VerifiedBy)
+	_, err = tx.Exec(ctx, `INSERT INTO quality_records
+		(artifact_id, mission_id, subtask_id, producer_agent_id, producer_platform, attempt,
+		 layers, score, confidence, verdict, failure_class, rubric, context_hash, verified_by, created_at)
+		VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		q.ArtifactID, q.MissionID, q.SubtaskID, q.ProducerAgentID, q.ProducerPlatform, q.Attempt,
+		layers, q.Score, q.Confidence, q.Verdict, q.FailureClass, q.Rubric, q.ContextHash, verifiedBy, now)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return store.ErrDuplicate
+		}
+		return err
+	}
+	for _, sig := range signals {
+		if err := applyReputationSignalTx(ctx, tx, sig, now); err != nil && !errors.Is(err, store.ErrDuplicate) {
+			return err
+		}
+	}
+	if err := putMeterTx(ctx, tx, &store.MeterRecord{ID: "meter:verify:" + q.ArtifactID,
+		MissionID: q.MissionID, SubtaskID: q.SubtaskID, Resource: "verify.call", Quantity: 1,
+		Trust: store.MeterAuthoritative}, now); err != nil {
+		return err
+	}
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: q.ArtifactID, MissionID: q.MissionID,
+		Type: "artifact.verified", Payload: map[string]any{"artifact_id": q.ArtifactID,
+			"score": q.Score, "confidence": q.Confidence, "verdict": q.Verdict,
+			"failure_class": q.FailureClass}, Actor: actor, Ts: now}); err != nil {
+		return err
+	}
+	q.CreatedAt = now
+	return tx.Commit(ctx)
+}
+
+func (s *Store) GetQuality(ctx context.Context, artifactID string) (*store.QualityRecord, error) {
+	var q store.QualityRecord
+	var layers, verifiedBy []byte
+	var subtaskID, producerID *string
+	err := s.pool.QueryRow(ctx, `SELECT artifact_id, mission_id, subtask_id, producer_agent_id,
+		producer_platform, attempt, layers, score, confidence, verdict, failure_class, rubric,
+		context_hash, verified_by, created_at FROM quality_records WHERE artifact_id=$1`, artifactID).
+		Scan(&q.ArtifactID, &q.MissionID, &subtaskID, &producerID, &q.ProducerPlatform,
+			&q.Attempt, &layers, &q.Score, &q.Confidence, &q.Verdict, &q.FailureClass,
+			&q.Rubric, &q.ContextHash, &verifiedBy, &q.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if subtaskID != nil {
+		q.SubtaskID = *subtaskID
+	}
+	if producerID != nil {
+		q.ProducerAgentID = *producerID
+	}
+	_ = json.Unmarshal(layers, &q.Layers)
+	_ = json.Unmarshal(verifiedBy, &q.VerifiedBy)
+	return &q, nil
+}
+
+func (s *Store) PutMeterRecord(ctx context.Context, m *store.MeterRecord, now time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	store.PriceMeter(m)
+	m.RecordedAt = now
+	metadata, _ := js(m.Metadata)
+	tag, err := tx.Exec(ctx, `INSERT INTO meter_records
+		(id, mission_id, subtask_id, agent_id, resource, quantity, unit, trust,
+		 price_book, unit_price, credits, metadata, recorded_at)
+		VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		ON CONFLICT (id) DO NOTHING`, m.ID, m.MissionID, m.SubtaskID, m.AgentID, m.Resource,
+		m.Quantity, m.Unit, m.Trust, m.PriceBook, m.UnitPrice, m.Credits, metadata, now)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrDuplicate
+	}
+	return tx.Commit(ctx)
+}
+
+func putMeterTx(ctx context.Context, tx pgx.Tx, m *store.MeterRecord, now time.Time) error {
+	store.PriceMeter(m)
+	m.RecordedAt = now
+	metadata, _ := js(m.Metadata)
+	_, err := tx.Exec(ctx, `INSERT INTO meter_records
+		(id, mission_id, subtask_id, agent_id, resource, quantity, unit, trust,
+		 price_book, unit_price, credits, metadata, recorded_at)
+		VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		ON CONFLICT (id) DO NOTHING`, m.ID, m.MissionID, m.SubtaskID, m.AgentID, m.Resource,
+		m.Quantity, m.Unit, m.Trust, m.PriceBook, m.UnitPrice, m.Credits, metadata, now)
+	return err
+}
+
+func recordLeaseMeter(ctx context.Context, tx pgx.Tx, sub *mission.Subtask, agentID string, now time.Time) error {
+	var createdAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT created_at FROM leases WHERE id=$1`, sub.LeaseID).Scan(&createdAt); err != nil {
+		return err
+	}
+	quantity := float64(now.Sub(createdAt).Milliseconds())
+	if quantity < 0 {
+		quantity = 0
+	}
+	return putMeterTx(ctx, tx, &store.MeterRecord{ID: "meter:lease:" + sub.LeaseID,
+		MissionID: sub.MissionID, SubtaskID: sub.ID, AgentID: agentID,
+		Resource: "lease.wall_ms", Quantity: quantity, Trust: store.MeterAuthoritative}, now)
+}
+
+func (s *Store) ListMeterRecords(ctx context.Context, missionID string) ([]*store.MeterRecord, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM missions WHERE id=$1)`, missionID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, store.ErrNotFound
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id, mission_id, subtask_id, agent_id, resource,
+		quantity, unit, trust, price_book, unit_price, credits, metadata, recorded_at
+		FROM meter_records WHERE mission_id=$1 ORDER BY recorded_at, id`, missionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*store.MeterRecord
+	for rows.Next() {
+		var m store.MeterRecord
+		var subtaskID, agentID *string
+		var metadata []byte
+		if err := rows.Scan(&m.ID, &m.MissionID, &subtaskID, &agentID, &m.Resource,
+			&m.Quantity, &m.Unit, &m.Trust, &m.PriceBook, &m.UnitPrice, &m.Credits,
+			&metadata, &m.RecordedAt); err != nil {
+			return nil, err
+		}
+		if subtaskID != nil {
+			m.SubtaskID = *subtaskID
+		}
+		if agentID != nil {
+			m.AgentID = *agentID
+		}
+		_ = json.Unmarshal(metadata, &m.Metadata)
+		out = append(out, &m)
+	}
+	return out, rows.Err()
 }
 
 // ---- 事件 ----

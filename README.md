@@ -3,7 +3,7 @@
 多智能体协同平台：跨 Agent 平台（OpenClaw / Hermes / 自研等）的任务拆解、中心化状态管理、调度与人在回路协作。
 
 - **设计文档**：[docs/design/multi-agent-collab-platform-design.md](docs/design/multi-agent-collab-platform-design.md)（22 节 + 附录，含架构、调度、触发体系、协作模式、质量/信誉/仿真/计量专题与技术选型 ADR）
-- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付 M1–M7 及 [M8 安全外部接入与协议生态](docs/plan/M8-ecosystem-security.md)）
+- **实现计划**：[docs/plan/](docs/plan/)（按里程碑拆分，已交付 M1–M9；最新为 [M9 质量、信誉、计量与可观测性](docs/plan/M9-quality-reputation-metering.md)）
 - **License**：[Apache 2.0](LICENSE)
 
 ## 开发流程约定（重要）
@@ -60,7 +60,8 @@ psql postgres://troop:troop@localhost:5432/troop -f migrations/0001_init.sql \
                                                -f migrations/0007_lead_recovery.sql \
                                                -f migrations/0008_budget.sql \
                                                -f migrations/0009_context_packages.sql \
-                                               -f migrations/0010_external_identity.sql
+                                               -f migrations/0010_external_identity.sql \
+                                               -f migrations/0011_quality_reputation_metering.sql
 TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
 
 # 探针：healthz 只检查进程；readyz 会真实检查 Store（PG 不可用时返回 503）
@@ -70,6 +71,30 @@ curl -f localhost:8080/readyz
 # 可选环境变量：TROOP_SCHEDULER=capability-first|round-robin（放置策略，M3）
 #               TROOP_BLOB_DIR=./data/artifacts（Artifact blob 目录）
 #               TROOP_AUTH_SECRET=<至少32字节>（生产必须；为空仅本地兼容模式）
+```
+
+## M9 API 示例（Verifier / 信誉 / 计量 / 可观测性）
+
+```bash
+# 外部 Verifier 完成 L2/L3 推理后提交结构化结果；控制面自动执行内容 hash/size L0。
+# Agent verifier 还需提交 verifier_agent_id，且不能验收自己的产物。
+curl -X POST localhost:8080/v1/artifacts/art_xxx/verify \
+  -H "Authorization: Bearer $VERIFIER_TOKEN" -d '{
+  "verifier_agent_id":"agt_judge", "score":0.92, "confidence":0.88,
+  "verdict":"accepted", "rubric":"rubric://report/v3",
+  "context_hash":"sha256:...",
+  "layers":{"L2":{"pass":true,"score":0.92,"confidence":0.88}}
+}'
+
+curl -H "Authorization: Bearer $HUMAN_TOKEN" \
+  localhost:8080/v1/artifacts/art_xxx/quality
+curl -H "Authorization: Bearer $AGENT_TOKEN" \
+  localhost:8080/v1/agents/agt_writer/reputation
+curl -H "Authorization: Bearer $HUMAN_TOKEN" \
+  localhost:8080/v1/missions/msn_xxx/usage
+curl -H "Authorization: Bearer $SERVICE_TOKEN" \
+  localhost:8080/v1/observability/snapshot
+curl -H "Authorization: Bearer $SERVICE_TOKEN" localhost:8080/metrics
 ```
 
 ## M8 API 示例（身份 / 签名资源 / A2A / MCP）
@@ -371,4 +396,5 @@ curl localhost:8080/v1/artifacts/art_xxx/content   # 响应头带 X-Artifact-SHA
 - **M7C ✅**：Mission 预算池、delegate 原子 hold 与完成/失败/取消结算（[计划](docs/plan/M7C-budget-holds.md)）
 - **M7D ✅ / M7 完成**：权限包络衰减、lease 级不可变上下文包、最小知情视图与 SHA-256 审计（[计划](docs/plan/M7D-context-permissions.md)）
 - **M8 ✅**：Bearer 外部身份与 Agent subject 绑定、签名 Artifact URL、A2A/MCP 协议边界、托管 HTTP Adapter 与 Python SDK（[计划](docs/plan/M8-ecosystem-security.md)）
-- **M9（下一阶段）**：Verifier 质量管线、信誉反馈闭环、权威计量与可观测性
+- **M9 ✅**：Verifier 分层质量记录、信誉反馈与调度闭环、权威/自报计量分账、Prometheus/trace 可观测性（[计划](docs/plan/M9-quality-reputation-metering.md)）
+- **M10（产品化）**：仿真/回放测试床、金丝雀样本与申诉流、Marketplace/原生平台 Adapter、完整 React Console、OIDC/KMS/对象存储与真实计费集成
