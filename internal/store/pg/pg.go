@@ -499,7 +499,7 @@ func (s *Store) HeartbeatAgent(ctx context.Context, id string, now time.Time) er
 	// 心跳即存活证明：suspect 自动恢复 healthy（down 不自动恢复，与 memory 实现一致）
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE agents SET health=jsonb_set(
-		   jsonb_set(health,'{last_heartbeat}',to_jsonb($2::text)),
+		   jsonb_set(health,'{last_heartbeat}',to_jsonb($2::timestamptz)),
 		   '{status}', to_jsonb(CASE WHEN health->>'status'='suspect' THEN 'healthy'
 		                             ELSE health->>'status' END)),
 		 updated_at=$2 WHERE id=$1`, id, now)
@@ -1358,7 +1358,7 @@ func (s *Store) SaveLeadSnapshot(ctx context.Context, leadSubtaskID string,
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE agents SET health=jsonb_set(
-		   jsonb_set(health,'{last_heartbeat}',to_jsonb($2::text)),
+		   jsonb_set(health,'{last_heartbeat}',to_jsonb($2::timestamptz)),
 		   '{status}',to_jsonb(CASE WHEN health->>'status'='suspect' THEN 'healthy'
 		                           ELSE health->>'status' END)),
 		 updated_at=$2 WHERE id=$1`, actor.ID, now); err != nil {

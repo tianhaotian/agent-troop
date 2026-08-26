@@ -308,7 +308,7 @@ func TestPGSpawnSubtask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OfferLease: %v", err)
 	}
-	sub, err := st.AcceptLease(ctx, l1.ID, l1.FencingToken, 1, agt, now)
+	sub, err := st.AcceptLease(ctx, l1.ID, l1.FencingToken, 2, agt, now)
 	if err != nil {
 		t.Fatalf("AcceptLease: %v", err)
 	}
