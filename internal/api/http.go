@@ -91,6 +91,15 @@ func (s *Server) Handler() http.Handler {
 	mux.handle("GET /v1/observability/snapshot", s.observabilitySnapshot)
 	mux.handle("GET /metrics", s.prometheusMetrics)
 
+	// 产品化（M10）
+	mux.handle("POST /v1/simulations/run", s.runSimulation)
+	mux.handle("POST /v1/canaries/evaluate", s.evaluateCanary)
+	mux.handle("GET /v1/marketplace/agents", s.marketplaceAgents)
+	mux.handle("POST /v1/artifacts/{id}/appeals", s.createAppeal)
+	mux.handle("GET /v1/appeals", s.listAppeals)
+	mux.handle("POST /v1/appeals/{id}/resolve", s.resolveAppeal)
+	mux.handle("POST /v1/metering/gateway", s.gatewayMeter)
+
 	// 触发准入（M4-G3）
 	mux.handle("POST /v1/intents", s.submitIntent)
 
@@ -118,6 +127,8 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, core.ErrInvalidDAG):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case errors.Is(err, core.ErrInvalidQuality):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, core.ErrInvalidProductInput):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case errors.Is(err, store.ErrDuplicate):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "duplicate: " + err.Error()})

@@ -2281,6 +2281,101 @@ func (s *Store) GetQuality(ctx context.Context, artifactID string) (*store.Quali
 	return &q, nil
 }
 
+func (s *Store) CreateQualityAppeal(ctx context.Context, a *store.QualityAppeal, actor store.Actor, now time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	evidence, _ := js(a.EvidenceRefs)
+	err = tx.QueryRow(ctx, `INSERT INTO quality_appeals
+		(id, artifact_id, mission_id, appellant_id, reason, evidence_refs, status, created_at)
+		SELECT $1, q.artifact_id, q.mission_id, $3, $4, $5, 'pending', $6
+		FROM quality_records q WHERE q.artifact_id=$2 RETURNING mission_id`,
+		a.ID, a.ArtifactID, a.AppellantID, a.Reason, evidence, now).Scan(&a.MissionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.ErrNotFound
+	}
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return store.ErrDuplicate
+		}
+		return err
+	}
+	a.Status, a.CreatedAt = store.AppealPending, now
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: a.ID, MissionID: a.MissionID,
+		Type: "quality.appeal.created", Payload: map[string]any{"appeal_id": a.ID,
+			"artifact_id": a.ArtifactID, "appellant_id": a.AppellantID}, Actor: actor, Ts: now}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) ListQualityAppeals(ctx context.Context, missionID string, pendingOnly bool) ([]*store.QualityAppeal, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, artifact_id, mission_id, appellant_id, reason,
+		evidence_refs, status, resolution, reviewer_id, correction_signal, created_at, resolved_at
+		FROM quality_appeals WHERE ($1='' OR mission_id=$1) AND (NOT $2 OR status='pending')
+		ORDER BY created_at, id`, missionID, pendingOnly)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*store.QualityAppeal
+	for rows.Next() {
+		var a store.QualityAppeal
+		var refs []byte
+		if err := rows.Scan(&a.ID, &a.ArtifactID, &a.MissionID, &a.AppellantID, &a.Reason,
+			&refs, &a.Status, &a.Resolution, &a.ReviewerID, &a.CorrectionSignal,
+			&a.CreatedAt, &a.ResolvedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(refs, &a.EvidenceRefs)
+		out = append(out, &a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ResolveQualityAppeal(ctx context.Context, id, status, resolution, reviewerID string,
+	actor store.Actor, now time.Time) (*store.QualityAppeal, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var a store.QualityAppeal
+	var refs []byte
+	err = tx.QueryRow(ctx, `UPDATE quality_appeals SET status=$2, resolution=$3, reviewer_id=$4,
+		resolved_at=$5 WHERE id=$1 AND status='pending' RETURNING id, artifact_id, mission_id,
+		appellant_id, reason, evidence_refs, status, resolution, reviewer_id, correction_signal,
+		created_at, resolved_at`, id, status, resolution, reviewerID, now).Scan(&a.ID, &a.ArtifactID,
+		&a.MissionID, &a.AppellantID, &a.Reason, &refs, &a.Status, &a.Resolution,
+		&a.ReviewerID, &a.CorrectionSignal, &a.CreatedAt, &a.ResolvedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM quality_appeals WHERE id=$1)`, id).Scan(&exists); e != nil {
+			return nil, e
+		}
+		if exists {
+			return nil, store.ErrConflict
+		}
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(refs, &a.EvidenceRefs)
+	if err := appendEvent(ctx, tx, &store.Event{AggregateID: a.ID, MissionID: a.MissionID,
+		Type: "quality.appeal.resolved", Payload: map[string]any{"appeal_id": a.ID,
+			"artifact_id": a.ArtifactID, "status": status}, Actor: actor, Ts: now}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
 func (s *Store) PutMeterRecord(ctx context.Context, m *store.MeterRecord, now time.Time) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

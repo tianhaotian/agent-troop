@@ -24,6 +24,8 @@ var (
 	platform = flag.String("platform", "custom", "runtime platform: openclaw, hermes or custom")
 	runtime  = flag.String("runtime", "http://localhost:9090", "external runtime base URL")
 	runPath  = flag.String("run-path", "/run", "runtime execution path")
+	profile  = flag.String("profile", "auto", "protocol profile: auto, generic, hermes or openclaw")
+	model    = flag.String("model", "", "runtime model (RUNTIME_MODEL fallback)")
 	skills   = flag.String("skills", "general", "comma-separated skills")
 	poll     = flag.Duration("poll", 500*time.Millisecond, "offer poll interval")
 )
@@ -147,10 +149,25 @@ type runtimeResult struct {
 }
 
 func invokeRuntime(ctx context.Context, current offer) (runtimeResult, error) {
-	body, _ := json.Marshal(map[string]any{
-		"task": current.Subtask, "context_package": current.ContextPackage,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(*runtime, "/")+*runPath, bytes.NewReader(body))
+	selected := *profile
+	if selected == "auto" {
+		selected = *platform
+	}
+	path := *runPath
+	payload := any(map[string]any{"task": current.Subtask, "context_package": current.ContextPackage})
+	if selected == "hermes" || selected == "openclaw" {
+		path = "/v1/responses"
+		selectedModel := *model
+		if selectedModel == "" {
+			selectedModel = envOr("RUNTIME_MODEL", "default")
+		}
+		contextJSON, _ := json.Marshal(current.ContextPackage)
+		payload = map[string]any{"model": selectedModel, "input": string(contextJSON), "metadata": map[string]string{
+			"troop_subtask_id": current.Subtask.ID, "troop_lease_id": current.LeaseID,
+		}}
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(*runtime, "/")+path, bytes.NewReader(body))
 	if err != nil {
 		return runtimeResult{}, err
 	}
@@ -167,9 +184,26 @@ func invokeRuntime(ctx context.Context, current offer) (runtimeResult, error) {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		return runtimeResult{}, fmt.Errorf("runtime status %d: %s", resp.StatusCode, data)
 	}
-	var result runtimeResult
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+	var raw struct {
+		ID          string `json:"id"`
+		ResultRef   string `json:"result_ref"`
+		UsageTokens int64  `json:"usage_tokens"`
+		Usage       struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+			TotalTokens  int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&raw); err != nil {
 		return runtimeResult{}, err
+	}
+	result := runtimeResult{ResultRef: raw.ResultRef, UsageTokens: raw.UsageTokens}
+	if selected == "hermes" || selected == "openclaw" {
+		result.ResultRef = "runtime://" + selected + "/responses/" + raw.ID
+		result.UsageTokens = raw.Usage.TotalTokens
+		if result.UsageTokens == 0 {
+			result.UsageTokens = raw.Usage.InputTokens + raw.Usage.OutputTokens
+		}
 	}
 	if result.UsageTokens < 0 {
 		return runtimeResult{}, errors.New("runtime returned negative usage_tokens")

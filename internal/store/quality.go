@@ -13,6 +13,9 @@ const (
 	MeterAuthoritative = "authoritative"
 	MeterSelfReported  = "self_reported"
 	PriceBookV1        = "credits-v1"
+	AppealPending      = "pending"
+	AppealUpheld       = "upheld"
+	AppealOverturned   = "overturned"
 )
 
 // QualityLayer 保存某一验收层的机器可读结果与证据。
@@ -41,6 +44,22 @@ type QualityRecord struct {
 	ContextHash      string                  `json:"context_hash,omitempty"`
 	VerifiedBy       []Actor                 `json:"verified_by"`
 	CreatedAt        time.Time               `json:"created_at"`
+}
+
+// QualityAppeal 是对不可变 QualityRecord 的审计式异议；裁决不覆盖原事实。
+type QualityAppeal struct {
+	ID               string     `json:"id"`
+	ArtifactID       string     `json:"artifact_id"`
+	MissionID        string     `json:"mission_id"`
+	AppellantID      string     `json:"appellant_id"`
+	Reason           string     `json:"reason"`
+	EvidenceRefs     []string   `json:"evidence_refs,omitempty"`
+	Status           string     `json:"status"`
+	Resolution       string     `json:"resolution,omitempty"`
+	ReviewerID       string     `json:"reviewer_id,omitempty"`
+	CorrectionSignal string     `json:"correction_signal,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ResolvedAt       *time.Time `json:"resolved_at,omitempty"`
 }
 
 // ReputationSignal 是信誉投影的幂等输入事实。
@@ -194,6 +213,10 @@ func PriceMeter(m *MeterRecord) {
 		m.Unit, m.UnitPrice = "fire", 0.001
 	case "token.reported":
 		m.Unit, m.UnitPrice = "token", 0 // 未经网关仲裁不结算
+	case "token.input":
+		m.Unit, m.UnitPrice = "token", 0.000002
+	case "token.output":
+		m.Unit, m.UnitPrice = "token", 0.000008
 	}
 	m.Credits = m.Quantity * m.UnitPrice
 }

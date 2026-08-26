@@ -43,15 +43,29 @@ func main() {
 	if err != nil {
 		log.Fatalf("scheduler: %v", err)
 	}
-	svc := core.New(st, clk, core.DefaultConfig()).
-		WithBlob(core.FSBlob{Dir: envOr("TROOP_BLOB_DIR", "./data/artifacts")}).
-		WithStrategy(strategy)
+	var blob core.BlobStore = core.FSBlob{Dir: envOr("TROOP_BLOB_DIR", "./data/artifacts")}
+	if endpoint := os.Getenv("TROOP_S3_ENDPOINT"); endpoint != "" {
+		blob = core.S3Blob{Endpoint: endpoint, Bucket: os.Getenv("TROOP_S3_BUCKET"),
+			Region: envOr("TROOP_S3_REGION", "us-east-1"), AccessKey: os.Getenv("TROOP_S3_ACCESS_KEY"),
+			SecretKey: os.Getenv("TROOP_S3_SECRET_KEY"), SessionToken: os.Getenv("TROOP_S3_SESSION_TOKEN"),
+			KMSKeyID: os.Getenv("TROOP_S3_KMS_KEY_ID")}
+		log.Printf("blob: S3-compatible bucket %s", os.Getenv("TROOP_S3_BUCKET"))
+	}
+	svc := core.New(st, clk, core.DefaultConfig()).WithBlob(blob).WithStrategy(strategy)
 	log.Printf("scheduler: %s", strategy.Name())
 	server := api.New(svc)
 	if secret := os.Getenv("TROOP_AUTH_SECRET"); secret != "" {
 		manager, err := auth.New(secret, clk)
 		if err != nil {
 			log.Fatalf("auth: %v", err)
+		}
+		if issuer := os.Getenv("TROOP_OIDC_ISSUER"); issuer != "" {
+			verifier, oidcErr := auth.NewOIDCVerifier(issuer, os.Getenv("TROOP_OIDC_AUDIENCE"), os.Getenv("TROOP_OIDC_JWKS_URL"), clk)
+			if oidcErr != nil {
+				log.Fatalf("oidc: %v", oidcErr)
+			}
+			manager.WithOIDC(verifier)
+			log.Printf("auth: OIDC/JWKS federation enabled")
 		}
 		server = api.NewAuthenticated(svc, manager)
 		log.Printf("auth: bearer authentication enabled")

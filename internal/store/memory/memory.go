@@ -34,6 +34,7 @@ type Store struct {
 	budgetHolds map[string]*store.BudgetHold       // by subtask id
 	contexts    map[string]*store.ContextPackage   // by lease id
 	quality     map[string]*store.QualityRecord    // by artifact id
+	appeals     map[string]*store.QualityAppeal    // by appeal id
 	reputations map[string]*store.ReputationRecord // agent id + NUL + skill
 	repSignals  map[string]struct{}
 	meters      map[string]*store.MeterRecord
@@ -58,6 +59,7 @@ func New() *Store {
 		budgetHolds: map[string]*store.BudgetHold{},
 		contexts:    map[string]*store.ContextPackage{},
 		quality:     map[string]*store.QualityRecord{},
+		appeals:     map[string]*store.QualityAppeal{},
 		reputations: map[string]*store.ReputationRecord{},
 		repSignals:  map[string]struct{}{},
 		meters:      map[string]*store.MeterRecord{},
@@ -1550,6 +1552,67 @@ func (s *Store) GetQuality(_ context.Context, artifactID string) (*store.Quality
 		return nil, store.ErrNotFound
 	}
 	return cloneQuality(q)
+}
+
+func (s *Store) CreateQualityAppeal(_ context.Context, a *store.QualityAppeal, actor store.Actor, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := s.quality[a.ArtifactID]
+	if q == nil {
+		return store.ErrNotFound
+	}
+	if _, exists := s.appeals[a.ID]; exists {
+		return store.ErrDuplicate
+	}
+	cp := *a
+	cp.MissionID, cp.Status, cp.CreatedAt = q.MissionID, store.AppealPending, now
+	cp.EvidenceRefs = append([]string(nil), a.EvidenceRefs...)
+	s.appeals[a.ID] = &cp
+	*a = cp
+	s.appendEventLocked(a.ID, a.MissionID, "quality.appeal.created", map[string]any{
+		"appeal_id": a.ID, "artifact_id": a.ArtifactID, "appellant_id": a.AppellantID,
+	}, actor, now)
+	return nil
+}
+
+func (s *Store) ListQualityAppeals(_ context.Context, missionID string, pendingOnly bool) ([]*store.QualityAppeal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*store.QualityAppeal
+	for _, a := range s.appeals {
+		if (missionID == "" || a.MissionID == missionID) && (!pendingOnly || a.Status == store.AppealPending) {
+			cp := *a
+			cp.EvidenceRefs = append([]string(nil), a.EvidenceRefs...)
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *Store) ResolveQualityAppeal(_ context.Context, id, status, resolution, reviewerID string,
+	actor store.Actor, now time.Time) (*store.QualityAppeal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.appeals[id]
+	if a == nil {
+		return nil, store.ErrNotFound
+	}
+	if a.Status != store.AppealPending {
+		return nil, store.ErrConflict
+	}
+	a.Status, a.Resolution, a.ReviewerID, a.ResolvedAt = status, resolution, reviewerID, &now
+	s.appendEventLocked(a.ID, a.MissionID, "quality.appeal.resolved", map[string]any{
+		"appeal_id": a.ID, "artifact_id": a.ArtifactID, "status": status,
+	}, actor, now)
+	cp := *a
+	cp.EvidenceRefs = append([]string(nil), a.EvidenceRefs...)
+	return &cp, nil
 }
 
 func cloneQuality(q *store.QualityRecord) (*store.QualityRecord, error) {

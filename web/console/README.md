@@ -1,5 +1,10 @@
 # Console
 
-最小只读控制台：Mission DAG 状态图 + 事件时间线（SSE 驱动）。
-当前已由 `internal/api/console.go` 提供最小只读 Console（DAG 状态 + SSE 时间线）。
-完整 React + React Flow 运维控制台留待后续产品化阶段。
+M10 React/Vite 运维台，覆盖 Overview、Marketplace、Simulation Lab、Quality Appeals、Mission Inspector 与 Usage。
+
+```bash
+npm install
+npm run dev
+```
+
+`VITE_TROOP_API` 可指定控制平面地址，默认同源。`troopd` 根路径仍内置零构建 Mission/SSE 控制台，适合单二进制部署；本目录可独立构建并交给 CDN/Ingress 托管。

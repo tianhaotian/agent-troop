@@ -61,7 +61,8 @@ psql postgres://troop:troop@localhost:5432/troop -f migrations/0001_init.sql \
                                                -f migrations/0008_budget.sql \
                                                -f migrations/0009_context_packages.sql \
                                                -f migrations/0010_external_identity.sql \
-                                               -f migrations/0011_quality_reputation_metering.sql
+                                               -f migrations/0011_quality_reputation_metering.sql \
+                                               -f migrations/0012_productization.sql
 TROOP_PG_DSN=postgres://troop:troop@localhost:5432/troop go run ./cmd/troopd
 
 # 探针：healthz 只检查进程；readyz 会真实检查 Store（PG 不可用时返回 503）
@@ -71,6 +72,9 @@ curl -f localhost:8080/readyz
 # 可选环境变量：TROOP_SCHEDULER=capability-first|round-robin（放置策略，M3）
 #               TROOP_BLOB_DIR=./data/artifacts（Artifact blob 目录）
 #               TROOP_AUTH_SECRET=<至少32字节>（生产必须；为空仅本地兼容模式）
+#               TROOP_OIDC_ISSUER/AUDIENCE/JWKS_URL（OIDC RS256 联邦）
+#               TROOP_S3_ENDPOINT/BUCKET/REGION/ACCESS_KEY/SECRET_KEY（S3-compatible blob）
+#               TROOP_S3_KMS_KEY_ID（可选 SSE-KMS key）
 ```
 
 ## M9 API 示例（Verifier / 信誉 / 计量 / 可观测性）
@@ -397,4 +401,4 @@ curl localhost:8080/v1/artifacts/art_xxx/content   # 响应头带 X-Artifact-SHA
 - **M7D ✅ / M7 完成**：权限包络衰减、lease 级不可变上下文包、最小知情视图与 SHA-256 审计（[计划](docs/plan/M7D-context-permissions.md)）
 - **M8 ✅**：Bearer 外部身份与 Agent subject 绑定、签名 Artifact URL、A2A/MCP 协议边界、托管 HTTP Adapter 与 Python SDK（[计划](docs/plan/M8-ecosystem-security.md)）
 - **M9 ✅**：Verifier 分层质量记录、信誉反馈与调度闭环、权威/自报计量分账、Prometheus/trace 可观测性（[计划](docs/plan/M9-quality-reputation-metering.md)）
-- **M10（产品化）**：仿真/回放测试床、金丝雀样本与申诉流、Marketplace/原生平台 Adapter、完整 React Console、OIDC/KMS/对象存储与真实计费集成
+- ✅ **M10（产品化）**：确定性仿真/回放测试床、金丝雀校准与持久化申诉流、信誉 Marketplace、Hermes/OpenClaw 原生兼容 Adapter、产品 Console、OIDC/JWKS、S3/KMS 对象存储与权威 token 计费网关

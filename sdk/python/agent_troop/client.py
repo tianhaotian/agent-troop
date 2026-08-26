@@ -130,6 +130,46 @@ class Client:
     def observability_snapshot(self) -> Dict[str, Any]:
         return self.request("GET", "/v1/observability/snapshot")
 
+    def run_simulation(self, **scenario: Any) -> Dict[str, Any]:
+        return self.request("POST", "/v1/simulations/run", scenario)
+
+    def marketplace(self, *, skill: str = "", platform: str = "",
+                    min_reputation: float = 0.0, healthy: bool = True) -> List[Dict[str, Any]]:
+        query = urllib.parse.urlencode({"skill": skill, "platform": platform,
+                                        "min_reputation": min_reputation,
+                                        "healthy": str(healthy).lower()})
+        return self.request("GET", f"/v1/marketplace/agents?{query}")["agents"]
+
+    def evaluate_canary(self, **sample: Any) -> Dict[str, Any]:
+        return self.request("POST", "/v1/canaries/evaluate", sample)
+
+    def create_appeal(self, artifact_id: str, appellant_id: str, reason: str,
+                      evidence_refs: Optional[List[str]] = None) -> Dict[str, Any]:
+        return self.request("POST", f"/v1/artifacts/{urllib.parse.quote(artifact_id)}/appeals", {
+            "appellant_id": appellant_id, "reason": reason,
+            "evidence_refs": evidence_refs or [],
+        })
+
+    def appeals(self, *, mission_id: str = "", pending: bool = False) -> List[Dict[str, Any]]:
+        query = urllib.parse.urlencode({"mission_id": mission_id, "pending": str(pending).lower()})
+        return self.request("GET", f"/v1/appeals?{query}")["appeals"]
+
+    def resolve_appeal(self, appeal_id: str, status: str, resolution: str,
+                       reviewer_id: str) -> Dict[str, Any]:
+        return self.request("POST", f"/v1/appeals/{urllib.parse.quote(appeal_id)}/resolve", {
+            "status": status, "resolution": resolution, "reviewer_id": reviewer_id,
+        })
+
+    def record_gateway_usage(self, record_id: str, mission_id: str, *,
+                             input_tokens: int, output_tokens: int,
+                             subtask_id: str = "", agent_id: str = "",
+                             provider: str = "", model: str = "") -> Dict[str, Any]:
+        return self.request("POST", "/v1/metering/gateway", {
+            "id": record_id, "mission_id": mission_id, "subtask_id": subtask_id,
+            "agent_id": agent_id, "provider": provider, "model": model,
+            "input_tokens": input_tokens, "output_tokens": output_tokens,
+        })
+
 
 @dataclass
 class AgentWorker:

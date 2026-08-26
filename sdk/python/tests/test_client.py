@@ -68,6 +68,19 @@ class WorkerTest(unittest.TestCase):
         client.observability_snapshot()
         self.assertEqual(client.calls[-1][1], "/v1/observability/snapshot")
 
+    def test_productization_methods(self):
+        client = FakeClient()
+        client.run_simulation(scenario="chaos", seed=42, tasks=10, agents=2)
+        self.assertEqual(client.calls[-1][1], "/v1/simulations/run")
+        client.evaluate_canary(id="gold", verifier_agent_id="judge")
+        self.assertEqual(client.calls[-1][1], "/v1/canaries/evaluate")
+        client.create_appeal("art/1", "owner", "wrong verdict")
+        self.assertEqual(client.calls[-1][1], "/v1/artifacts/art/1/appeals")
+        client.resolve_appeal("apl/1", "overturned", "evidence accepted", "lead")
+        self.assertEqual(client.calls[-1][1], "/v1/appeals/apl/1/resolve")
+        client.record_gateway_usage("req-1", "msn-1", input_tokens=10, output_tokens=4)
+        self.assertEqual(client.calls[-1][2]["input_tokens"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,3 +27,10 @@ TROOP_TOKEN=... RUNTIME_TOKEN=... go run ./adapters/managed-http \
 
 认证开启时，Agent 必须先由 human/service 身份注册，且 `auth_subject` 与
 `TROOP_TOKEN` 的 subject 相同；Adapter 遇到注册 403 后会使用已配置身份继续运行。
+Profiles:
+
+- `-profile generic`: legacy/custom `POST /run` contract.
+- `-profile hermes`: Hermes OpenAI-compatible `POST /v1/responses`.
+- `-profile openclaw`: OpenClaw Gateway OpenAI-compatible `POST /v1/responses` compatibility surface. OpenClaw Gateway WebSocket remains the canonical RPC for deeper integrations.
+
+Set `RUNTIME_TOKEN` and `RUNTIME_MODEL`, then use `-runtime` for the Hermes API server or OpenClaw Gateway URL. The adapter propagates the returned token usage into Agent Troop's budget settlement.

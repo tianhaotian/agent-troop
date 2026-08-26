@@ -392,6 +392,9 @@ type Store interface {
 	GetArtifact(ctx context.Context, id string) (*Artifact, error)
 	RecordQuality(ctx context.Context, q *QualityRecord, signals []ReputationSignal, actor Actor, now time.Time) error
 	GetQuality(ctx context.Context, artifactID string) (*QualityRecord, error)
+	CreateQualityAppeal(ctx context.Context, a *QualityAppeal, actor Actor, now time.Time) error
+	ListQualityAppeals(ctx context.Context, missionID string, pendingOnly bool) ([]*QualityAppeal, error)
+	ResolveQualityAppeal(ctx context.Context, id, status, resolution, reviewerID string, actor Actor, now time.Time) (*QualityAppeal, error)
 
 	// ---- 权威计量（M9） ----
 	PutMeterRecord(ctx context.Context, m *MeterRecord, now time.Time) error

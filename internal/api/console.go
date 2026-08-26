@@ -2,13 +2,12 @@ package api
 
 import "net/http"
 
-// 最小只读 Console（M1 切片 S11）：输入 Mission ID 后展示子任务状态与
-// SSE 事件时间线。正式 React Console 见 web/console/（M2）。
+// 产品 Console：Mission 实时视图，并提供 M10 运维工作区入口。
 const consoleHTML = `<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Agent Troop Console (M1)</title>
+<title>Agent Troop Product Console</title>
 <style>
   body { font-family: ui-monospace, Menlo, monospace; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
   input { padding: .4rem; width: 22rem; }
@@ -22,7 +21,8 @@ const consoleHTML = `<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Agent Troop <small>M1 Console</small></h1>
+<h1>Agent Troop <small>M10 Product Console</small></h1>
+<p><a href="/v1/marketplace/agents">Marketplace</a> · <a href="/v1/appeals?pending=true">Quality Appeals</a> · <a href="/v1/observability/snapshot">Observability</a></p>
 <div>
   <input id="mid" placeholder="Mission ID (msn_...)">
   <button onclick="watch()">Watch</button>

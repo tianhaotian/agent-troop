@@ -50,7 +50,10 @@ func (i Identity) Privileged() bool { return i.Kind == "human" || i.Kind == "ser
 type Manager struct {
 	secret []byte
 	clk    clock.Clock
+	oidc   *OIDCVerifier
 }
+
+func (m *Manager) WithOIDC(verifier *OIDCVerifier) *Manager { m.oidc = verifier; return m }
 
 func New(secret string, clk clock.Clock) (*Manager, error) {
 	if len(secret) < 32 {
@@ -86,17 +89,23 @@ func (m *Manager) Verify(token string) (Identity, error) {
 	if len(parts) != 3 {
 		return Identity{}, ErrInvalidToken
 	}
-	unsigned := parts[0] + "." + parts[1]
-	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil || !hmac.Equal(sig, m.mac(unsigned)) {
-		return Identity{}, ErrInvalidToken
-	}
 	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
 		return Identity{}, ErrInvalidToken
 	}
 	var header map[string]string
-	if json.Unmarshal(headerBytes, &header) != nil || header["alg"] != "HS256" || header["typ"] != "TROOP" {
+	if json.Unmarshal(headerBytes, &header) != nil {
+		return Identity{}, ErrInvalidToken
+	}
+	if header["alg"] == "RS256" && m.oidc != nil {
+		return m.oidc.Verify(token)
+	}
+	unsigned := parts[0] + "." + parts[1]
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || !hmac.Equal(sig, m.mac(unsigned)) {
+		return Identity{}, ErrInvalidToken
+	}
+	if header["alg"] != "HS256" || header["typ"] != "TROOP" {
 		return Identity{}, ErrInvalidToken
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])

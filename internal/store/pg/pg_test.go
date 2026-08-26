@@ -34,7 +34,7 @@ func testStore(t *testing.T) *Store {
 	applyMigrations(t, ctx, st)
 	// 清场（测试库专用！）
 	if _, err := st.pool.Exec(ctx,
-		`TRUNCATE quality_records, reputation_signals, reputations, meter_records,
+		`TRUNCATE quality_appeals, quality_records, reputation_signals, reputations, meter_records,
 		 missions, subtasks, agents, leases, artifacts, decisions, idempotency_keys,
 		 events, board_entries, lead_inbox, budget_holds, mission_budgets, context_packages`); err != nil {
 		t.Fatalf("clean: %v", err)

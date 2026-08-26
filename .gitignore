@@ -10,6 +10,7 @@ data/
 # Node (console)
 node_modules/
 dist/
+*.tsbuildinfo
 
 # Python SDK
 __pycache__/
