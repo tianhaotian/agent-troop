@@ -245,13 +245,20 @@ func TestPGConformance(t *testing.T) {
 	}
 	// 事件流完整且有序
 	evs, err := st.ListMissionEvents(ctx, m.ID, 0, 100)
-	if err != nil || len(evs) != 7 {
-		t.Fatalf("events=%d err=%v, want 7", len(evs), err)
+	if err != nil || len(evs) != 8 {
+		t.Fatalf("events=%d err=%v, want 8", len(evs), err)
 	}
+	foundContext := false
 	for i := 1; i < len(evs); i++ {
 		if evs[i].Seq <= evs[i-1].Seq {
 			t.Fatal("seq not increasing")
 		}
+	}
+	for _, ev := range evs {
+		foundContext = foundContext || ev.Type == "context.materialized"
+	}
+	if !foundContext {
+		t.Fatal("context.materialized event missing")
 	}
 }
 
