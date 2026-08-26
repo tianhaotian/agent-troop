@@ -43,6 +43,16 @@ func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 func js(v any) ([]byte, error) { return json.Marshal(v) }
 
+// textArray keeps nil Go slices from becoming SQL NULL. PostgreSQL array
+// columns such as subtasks.depends_on are NOT NULL; an omitted dependency list
+// therefore has to cross the persistence boundary as an empty array.
+func textArray(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
+}
+
 func scanSubtask(row pgx.Row) (*mission.Subtask, error) {
 	var sub mission.Subtask
 	var kind, state string
@@ -178,7 +188,7 @@ func (s *Store) CreateMission(ctx context.Context, m *mission.Mission, subs []*m
 			 depends_on, attempt, version, created_at, updated_at)
 			 VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7,$8,$9,$10,0,$11,$11)`,
 			sub.ID, sub.MissionID, sub.ParentID, string(sub.Kind), spec, scheduling, retry,
-			string(sub.State), sub.DependsOn, sub.Attempt, now); err != nil {
+			string(sub.State), textArray(sub.DependsOn), sub.Attempt, now); err != nil {
 			return err
 		}
 		ev := &store.Event{AggregateID: sub.ID, MissionID: sub.MissionID, Type: string(mission.EvCreated),
